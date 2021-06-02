@@ -6,8 +6,10 @@
 #![allow(clippy::manual_range_contains)]
 
 use uint::construct_uint;
+use borsh::{BorshSerialize, BorshDeserialize};
 
 construct_uint! {
+    #[derive(BorshSerialize, BorshDeserialize)]
     pub struct U256(4);
 }
 construct_uint! {

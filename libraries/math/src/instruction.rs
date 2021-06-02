@@ -1,5 +1,6 @@
 //! Program instructions, used for end-to-end testing and instruction counts
 
+use crate::uint::U256;
 use {
     crate::id,
     borsh::{BorshDeserialize, BorshSerialize},
@@ -8,7 +9,7 @@ use {
 
 /// Instructions supported by the math program, used for testing instruction
 /// counts
-#[derive(Clone, Debug, BorshSerialize, BorshDeserialize, PartialEq)]
+#[derive(Clone, Debug, BorshDeserialize, BorshSerialize, PartialEq)]
 pub enum MathInstruction {
     /// Calculate the square root of the given u64 with decimals
     ///
@@ -74,6 +75,13 @@ pub enum MathInstruction {
     ///
     /// No accounts required for this instruction
     Noop,
+    /// Bla
+    U256Multiply {
+        /// The multiplicand
+        multiplicand: U256,
+        /// The multipier
+        multiplier: U256,
+    },
 }
 
 /// Create PreciseSquareRoot instruction
@@ -165,5 +173,16 @@ pub fn noop() -> Instruction {
         program_id: id(),
         accounts: vec![],
         data: MathInstruction::Noop.try_to_vec().unwrap(),
+    }
+}
+
+/// Create PreciseSquareRoot instruction
+pub fn u256_multiply(multiplicand: U256, multiplier: U256) -> Instruction {
+    Instruction {
+        program_id: id(),
+        accounts: vec![],
+        data: MathInstruction::U256Multiply { multiplicand, multiplier }
+            .try_to_vec()
+            .unwrap(),
     }
 }

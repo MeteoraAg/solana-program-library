@@ -161,3 +161,17 @@ async fn test_noop() {
     transaction.sign(&[&payer], recent_blockhash);
     banks_client.process_transaction(transaction).await.unwrap();
 }
+
+#[tokio::test]
+async fn test_u256_multiply() {
+    let mut pc = ProgramTest::new("spl_math", id(), processor!(process_instruction));
+
+    //pc.set_bpf_compute_max_units(1350);
+
+    let (mut banks_client, payer, recent_blockhash) = pc.start().await;
+
+    let mut transaction =
+        Transaction::new_with_payer(&[instruction::u256_multiply(42.into(), 84.into())], Some(&payer.pubkey()));
+    transaction.sign(&[&payer], recent_blockhash);
+    banks_client.process_transaction(transaction).await.unwrap();
+}

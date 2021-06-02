@@ -109,5 +109,13 @@ pub fn process_instruction(
             msg!("{}", 0_u64);
             Ok(())
         }
+        MathInstruction::U256Multiply { multiplicand, multiplier } => {
+            msg!("Calculating U256 Multiply");
+            sol_log_compute_units();
+            let result = multiplicand.checked_mul(multiplier).unwrap();
+            sol_log_compute_units();
+            msg!("{}", result);
+            Ok(())
+        }
     }
 }
