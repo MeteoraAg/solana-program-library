@@ -28,7 +28,7 @@ use solana_program::{
 };
 use spl_token::solana_program::instruction::AccountMeta;
 use spl_token::state::{Account, Mint};
-use std::{convert::TryInto, result::Result};
+use std::{cmp::min, convert::TryInto, result::Result};
 use switchboard_program::{
     get_aggregator, get_aggregator_result, AggregatorState, RoundResult, SwitchboardAccountType,
 };
@@ -143,6 +143,10 @@ pub fn process_instruction(
                 liquidity_amount,
                 accounts,
             )
+        }
+        LendingInstruction::RedeemFees => {
+            msg!("Instruction: RedeemFees");
+            process_redeem_fees(program_id, accounts)
         }
     }
 }
@@ -893,8 +897,12 @@ fn process_refresh_obligation(program_id: &Pubkey, accounts: &[AccountInfo]) -> 
 
     obligation.deposited_value = deposited_value;
     obligation.borrowed_value = borrowed_value;
-    obligation.allowed_borrow_value = allowed_borrow_value;
-    obligation.unhealthy_borrow_value = unhealthy_borrow_value;
+
+    let global_unhealthy_borrow_value = Decimal::from(50000000u64);
+    let global_allowed_borrow_value = Decimal::from(45000000u64);
+
+    obligation.allowed_borrow_value = min(allowed_borrow_value, global_allowed_borrow_value);
+    obligation.unhealthy_borrow_value = min(unhealthy_borrow_value, global_unhealthy_borrow_value);
 
     obligation.last_update.update_slot(clock.slot);
     Obligation::pack(obligation, &mut obligation_info.data.borrow_mut())?;
@@ -1831,7 +1839,7 @@ fn process_liquidate_obligation_and_redeem_reserve_collateral(
     let token_program_id = next_account_info(account_info_iter)?;
     let clock = &Clock::get()?;
 
-    let withdraw_collateral_amount = _liquidate_obligation(
+    let withdrawn_collateral_amount = _liquidate_obligation(
         program_id,
         liquidity_amount,
         source_liquidity_info,
@@ -1849,36 +1857,45 @@ fn process_liquidate_obligation_and_redeem_reserve_collateral(
     )?;
 
     _refresh_reserve_interest(program_id, withdraw_reserve_info, clock)?;
-    let withdraw_liquidity_amount = _redeem_reserve_collateral(
-        program_id,
-        withdraw_collateral_amount,
-        destination_collateral_info,
-        destination_liquidity_info,
-        withdraw_reserve_info,
-        withdraw_reserve_collateral_mint_info,
-        withdraw_reserve_liquidity_supply_info,
-        lending_market_info,
-        lending_market_authority_info,
-        user_transfer_authority_info,
-        clock,
-        token_program_id,
-    )?;
     let withdraw_reserve = Reserve::unpack(&withdraw_reserve_info.data.borrow())?;
-    if &withdraw_reserve.config.fee_receiver != withdraw_reserve_liquidity_fee_receiver_info.key {
-        msg!("Withdraw reserve liquidity fee receiver does not match the reserve liquidity fee receiver provided");
-        return Err(LendingError::InvalidAccountInput.into());
-    }
-    let protocol_fee =
-        withdraw_reserve.calculate_protocol_liquidation_fee(withdraw_liquidity_amount)?;
+    let collateral_exchange_rate = withdraw_reserve.collateral_exchange_rate()?;
+    let max_redeemable_collateral = collateral_exchange_rate
+        .liquidity_to_collateral(withdraw_reserve.liquidity.available_amount)?;
+    let withdraw_collateral_amount = min(withdrawn_collateral_amount, max_redeemable_collateral);
+    // if there is liquidity redeem it
+    if withdraw_collateral_amount != 0 {
+        let withdraw_liquidity_amount = _redeem_reserve_collateral(
+            program_id,
+            withdraw_collateral_amount,
+            destination_collateral_info,
+            destination_liquidity_info,
+            withdraw_reserve_info,
+            withdraw_reserve_collateral_mint_info,
+            withdraw_reserve_liquidity_supply_info,
+            lending_market_info,
+            lending_market_authority_info,
+            user_transfer_authority_info,
+            clock,
+            token_program_id,
+        )?;
+        let withdraw_reserve = Reserve::unpack(&withdraw_reserve_info.data.borrow())?;
+        if &withdraw_reserve.config.fee_receiver != withdraw_reserve_liquidity_fee_receiver_info.key
+        {
+            msg!("Withdraw reserve liquidity fee receiver does not match the reserve liquidity fee receiver provided");
+            return Err(LendingError::InvalidAccountInput.into());
+        }
+        let protocol_fee =
+            withdraw_reserve.calculate_protocol_liquidation_fee(withdraw_liquidity_amount)?;
 
-    spl_token_transfer(TokenTransferParams {
-        source: destination_liquidity_info.clone(),
-        destination: withdraw_reserve_liquidity_fee_receiver_info.clone(),
-        amount: protocol_fee,
-        authority: user_transfer_authority_info.clone(),
-        authority_signer_seeds: &[],
-        token_program: token_program_id.clone(),
-    })?;
+        spl_token_transfer(TokenTransferParams {
+            source: destination_liquidity_info.clone(),
+            destination: withdraw_reserve_liquidity_fee_receiver_info.clone(),
+            amount: protocol_fee,
+            authority: user_transfer_authority_info.clone(),
+            authority_signer_seeds: &[],
+            token_program: token_program_id.clone(),
+        })?;
+    }
 
     Ok(())
 }
@@ -2197,6 +2214,87 @@ fn process_update_reserve_config(
     Ok(())
 }
 
+#[inline(never)] // avoid stack frame limit
+fn process_redeem_fees(program_id: &Pubkey, accounts: &[AccountInfo]) -> ProgramResult {
+    let account_info_iter = &mut accounts.iter().peekable();
+    let reserve_info = next_account_info(account_info_iter)?;
+    let reserve_liquidity_fee_receiver_info = next_account_info(account_info_iter)?;
+    let reserve_supply_liquidity_info = next_account_info(account_info_iter)?;
+    let lending_market_info = next_account_info(account_info_iter)?;
+    let lending_market_authority_info = next_account_info(account_info_iter)?;
+    let token_program_id = next_account_info(account_info_iter)?;
+    let clock = &Clock::get()?;
+
+    let mut reserve = Reserve::unpack(&reserve_info.data.borrow())?;
+    if reserve_info.owner != program_id {
+        msg!(
+            "Reserve provided is not owned by the lending program {} != {}",
+            &reserve_info.owner.to_string(),
+            &program_id.to_string(),
+        );
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+
+    if &reserve.config.fee_receiver != reserve_liquidity_fee_receiver_info.key {
+        msg!("Reserve liquidity fee receiver does not match the reserve liquidity fee receiver provided");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+    if &reserve.liquidity.supply_pubkey != reserve_supply_liquidity_info.key {
+        msg!("Reserve liquidity supply must be used as the reserve supply liquidity provided");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+    if &reserve.lending_market != lending_market_info.key {
+        msg!("Reserve lending market does not match the lending market provided");
+        return Err(LendingError::InvalidAccountInput.into());
+    }
+    if reserve.last_update.is_stale(clock.slot)? {
+        msg!("reserve is stale and must be refreshed in the current slot");
+        return Err(LendingError::ReserveStale.into());
+    }
+
+    let lending_market = LendingMarket::unpack(&lending_market_info.data.borrow())?;
+    if lending_market_info.owner != program_id {
+        msg!("Lending market provided is not owned by the lending program");
+        return Err(LendingError::InvalidAccountOwner.into());
+    }
+    if &lending_market.token_program_id != token_program_id.key {
+        msg!("Lending market token program does not match the token program provided");
+        return Err(LendingError::InvalidTokenProgram.into());
+    }
+    let authority_signer_seeds = &[
+        lending_market_info.key.as_ref(),
+        &[lending_market.bump_seed],
+    ];
+    let lending_market_authority_pubkey =
+        Pubkey::create_program_address(authority_signer_seeds, program_id)?;
+    if &lending_market_authority_pubkey != lending_market_authority_info.key {
+        msg!(
+            "Derived lending market authority does not match the lending market authority provided"
+        );
+        return Err(LendingError::InvalidMarketAuthority.into());
+    }
+
+    let withdraw_amount = reserve.calculate_redeem_fees()?;
+    if withdraw_amount == 0 {
+        return Err(LendingError::InsufficientProtocolFeesToRedeem.into());
+    }
+
+    reserve.liquidity.redeem_fees(withdraw_amount)?;
+    reserve.last_update.mark_stale();
+    Reserve::pack(reserve, &mut reserve_info.data.borrow_mut())?;
+
+    spl_token_transfer(TokenTransferParams {
+        source: reserve_supply_liquidity_info.clone(),
+        destination: reserve_liquidity_fee_receiver_info.clone(),
+        amount: withdraw_amount,
+        authority: lending_market_authority_info.clone(),
+        authority_signer_seeds,
+        token_program: token_program_id.clone(),
+    })?;
+
+    Ok(())
+}
+
 fn assert_rent_exempt(rent: &Rent, account_info: &AccountInfo) -> ProgramResult {
     if !rent.is_exempt(account_info.lamports(), account_info.data_len()) {
         msg!(
@@ -2428,7 +2526,7 @@ fn get_switchboard_price_v2(
         return Err(LendingError::InvalidOracleConfig.into());
     }
     let price = Decimal::from(price_switchboard_desc.mantissa as u128);
-    let exp = (10u64).checked_pow(price_switchboard_desc.scale).unwrap();
+    let exp = Decimal::from((10u128).checked_pow(price_switchboard_desc.scale).unwrap());
     price.try_div(exp)
 }
 
@@ -2579,10 +2677,10 @@ fn validate_reserve_config(config: ReserveConfig) -> ProgramResult {
         msg!("Liquidation bonus must be in range [0, 100]");
         return Err(LendingError::InvalidConfig.into());
     }
-    if config.liquidation_threshold <= config.loan_to_value_ratio
+    if config.liquidation_threshold < config.loan_to_value_ratio
         || config.liquidation_threshold > 100
     {
-        msg!("Liquidation threshold must be in range (LTV, 100]");
+        msg!("Liquidation threshold must be in range [LTV, 100]");
         return Err(LendingError::InvalidConfig.into());
     }
     if config.optimal_borrow_rate < config.min_borrow_rate {
@@ -2603,6 +2701,10 @@ fn validate_reserve_config(config: ReserveConfig) -> ProgramResult {
     }
     if config.protocol_liquidation_fee > 100 {
         msg!("Protocol liquidation fee must be in range [0, 100]");
+        return Err(LendingError::InvalidConfig.into());
+    }
+    if config.protocol_take_rate > 100 {
+        msg!("Protocol take rate must be in range [0, 100]");
         return Err(LendingError::InvalidConfig.into());
     }
     Ok(())
