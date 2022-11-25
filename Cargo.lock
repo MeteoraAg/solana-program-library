@@ -3730,7 +3730,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "solend-program"
+name = "solend-program-bpf"
 version = "0.1.0"
 dependencies = [
  "arrayref",
@@ -3748,6 +3748,7 @@ dependencies = [
  "solana-sdk",
  "spl-token",
  "switchboard-program",
+ "switchboard-utils",
  "switchboard-v2",
  "thiserror",
  "uint",
@@ -3764,7 +3765,7 @@ dependencies = [
  "solana-logger",
  "solana-program",
  "solana-sdk",
- "solend-program",
+ "solend-program-bpf",
  "spl-token",
 ]
 
@@ -3871,19 +3872,19 @@ dependencies = [
 
 [[package]]
 name = "switchboard-utils"
-version = "0.1.37"
+version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "28b18fece38368c160cb28b6f038c29aabd6936a13728b64537af90271384205"
+checksum = "0bc027ee269f663f2a6a848ee3c819936dbdbd35d74b9c4fb2aaf3f0360d903f"
 dependencies = [
  "bincode",
  "borsh",
- "bytemuck",
  "byteorder",
  "quick-protobuf",
  "rust_decimal",
  "rust_decimal_macros",
  "solana-program",
  "switchboard-protos",
+ "zerocopy",
 ]
 
 [[package]]

@@ -1,5 +1,5 @@
 [package]
-name = "solend-program"
+name = "solend-program-bpf"
 version = "0.1.0"
 description = "Solend Program"
 authors = ["Solend Maintainers <maintainers@solend.fi>"]
@@ -22,6 +22,7 @@ switchboard-program = "0.1.59"
 switchboard-v2 = "0.1.3"
 thiserror = "1.0"
 uint = "0.9.0"
+switchboard-utils = "=0.1.32"
 
 [dev-dependencies]
 assert_matches = "1.5.0"
