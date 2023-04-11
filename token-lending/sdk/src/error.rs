@@ -1,7 +1,9 @@
 //! Error types
 
 use num_derive::FromPrimitive;
+use num_traits::FromPrimitive;
 use solana_program::{decode_error::DecodeError, program_error::ProgramError};
+use solana_program::{msg, program_error::PrintProgramError};
 use thiserror::Error;
 
 /// Errors that may be returned by the TokenLending program.
@@ -167,6 +169,32 @@ pub enum LendingError {
     /// Insufficent protocol fees to redeem or no liquidity availible to process redeem
     #[error("Insufficent protocol fees to claim or no liquidity availible")]
     InsufficientProtocolFeesToRedeem,
+    /// No cpi flash borrows allowed
+    #[error("No cpi flash borrows allowed")]
+    FlashBorrowCpi,
+    /// No corresponding repay found for flash borrow
+    #[error("No corresponding repay found for flash borrow")]
+    NoFlashRepayFound,
+    /// Invalid flash repay found for borrow
+    #[error("Invalid repay found")]
+    InvalidFlashRepay,
+
+    // 50
+    /// No cpi flash repays allowed
+    #[error("No cpi flash repays allowed")]
+    FlashRepayCpi,
+    /// Multiple flash borrows not allowed in the same transaction
+    #[error("Multiple flash borrows not allowed in the same transaction")]
+    MultipleFlashBorrows,
+    /// Flash loans are disabled for this reserve
+    #[error("Flash loans are disabled for this reserve")]
+    FlashLoansDisabled,
+    /// Deprecated instruction
+    #[error("Instruction is deprecated")]
+    DeprecatedInstruction,
+    /// Outflow Rate Limit Exceeded
+    #[error("Outflow Rate Limit Exceeded")]
+    OutflowRateLimitExceeded,
 }
 
 impl From<LendingError> for ProgramError {
@@ -178,5 +206,14 @@ impl From<LendingError> for ProgramError {
 impl<T> DecodeError<T> for LendingError {
     fn type_of() -> &'static str {
         "Lending Error"
+    }
+}
+
+impl PrintProgramError for LendingError {
+    fn print<E>(&self)
+    where
+        E: 'static + std::error::Error + DecodeError<E> + PrintProgramError + FromPrimitive,
+    {
+        msg!(&self.to_string());
     }
 }

@@ -18,13 +18,13 @@
 if [[ -n $RUST_STABLE_VERSION ]]; then
   stable_version="$RUST_STABLE_VERSION"
 else
-  stable_version=1.58.1
+  stable_version=1.65.0
 fi
 
 if [[ -n $RUST_NIGHTLY_VERSION ]]; then
   nightly_version="$RUST_NIGHTLY_VERSION"
 else
-  nightly_version=2022-01-30
+  nightly_version=2022-04-01
 fi
 
 
@@ -51,9 +51,9 @@ export rust_nightly_docker_image=solanalabs/rust-nightly:"$nightly_version"
   stable)
      rustup_install "$rust_stable"
      ;;
-  # nightly)
-  #    rustup_install "$rust_nightly"
-  #   ;;
+  nightly)
+     rustup_install "$rust_nightly"
+    ;;
   all)
      rustup_install "$rust_stable"
      rustup_install "$rust_nightly"
