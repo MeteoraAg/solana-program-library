@@ -1,3 +1,17 @@
+use lending_state::SolendState;
+use solana_client::rpc_config::RpcSendTransactionConfig;
+use solana_sdk::{commitment_config::CommitmentLevel, compute_budget::ComputeBudgetInstruction};
+use solend_program::{instruction::set_lending_market_owner_and_config, state::RateLimiterConfig};
+use solend_sdk::{
+    instruction::{
+        liquidate_obligation_and_redeem_reserve_collateral, redeem_reserve_collateral,
+        refresh_obligation, refresh_reserve,
+    },
+    state::Obligation,
+};
+
+mod lending_state;
+
 use {
     clap::{
         crate_description, crate_name, crate_version, value_t, App, AppSettings, Arg, ArgMatches,
@@ -10,14 +24,16 @@ use {
         keypair::signer_from_path,
     },
     solana_client::rpc_client::RpcClient,
-    solana_program::{native_token::lamports_to_sol, program_pack::Pack, pubkey::Pubkey},
+    solana_program::{
+        message::Message, native_token::lamports_to_sol, program_pack::Pack, pubkey::Pubkey,
+    },
     solana_sdk::{
         commitment_config::CommitmentConfig,
         signature::{Keypair, Signer},
         system_instruction,
         transaction::Transaction,
     },
-    solend_program::{
+    solend_sdk::{
         self,
         instruction::{init_lending_market, init_reserve, update_reserve_config},
         math::WAD,
@@ -32,6 +48,9 @@ use {
     std::{borrow::Borrow, process::exit, str::FromStr},
     system_instruction::create_account,
 };
+
+use spl_associated_token_account::get_associated_token_address;
+use spl_associated_token_account::instruction::create_associated_token_account;
 
 struct Config {
     rpc_client: RpcClient,
@@ -68,6 +87,14 @@ struct PartialReserveConfig {
     pub fee_receiver: Option<Pubkey>,
     /// Cut of the liquidation bonus that the protocol receives, as a percentage
     pub protocol_liquidation_fee: Option<u8>,
+    /// Protocol take rate is the amount borrowed interest protocol recieves, as a percentage  
+    pub protocol_take_rate: Option<u8>,
+    /// Rate Limiter's max window size
+    pub rate_limiter_window_duration: Option<u64>,
+    /// Rate Limiter's max outflow per window
+    pub rate_limiter_max_outflow: Option<u64>,
+    /// Added borrow weight in basis points
+    pub added_borrow_weight_bps: Option<u64>,
 }
 
 /// Reserve Fees with optional fields
@@ -90,7 +117,7 @@ const SWITCHBOARD_PROGRAM_ID_DEV: &str = "7azgmy1pFXHikv36q1zZASvFq5vFa39TT9NweV
 fn main() {
     solana_logger::setup_with_default("solana=info");
 
-    let default_lending_program_id: &str = &solend_program::id().to_string();
+    let default_lending_program_id: &str = &solend_sdk::solend_mainnet::id().to_string();
 
     let matches = App::new(crate_name!())
         .about(crate_description!())
@@ -189,6 +216,101 @@ fn main() {
                         .default_value("USD")
                         .help("Currency market prices are quoted in"),
                 ),
+        )
+        .subcommand(
+            SubCommand::with_name("liquidate-obligation")
+                .about("Liquidate Obligation and redeem reserve collateral")
+                // @TODO: use is_valid_signer
+                .arg(
+                    Arg::with_name("obligation")
+                        .long("obligation")
+                        .value_name("OBLIGATION_PUBKEY")
+                        .takes_value(true)
+                        .required(true)
+                        .help("obligation pubkey"),
+                )
+                .arg(
+                    Arg::with_name("repay-reserve")
+                        .long("repay-reserve")
+                        .value_name("RESERVE_PUBKEY")
+                        .takes_value(true)
+                        .required(true)
+                        .help("repay reserve"),
+                )
+                .arg(
+                    Arg::with_name("source-liquidity")
+                        .long("source-liquidity")
+                        .value_name("PUBKEY")
+                        .takes_value(true)
+                        .required(true)
+                        .help("Token account that repays the obligation's debt"),
+                )
+                .arg(
+                    Arg::with_name("withdraw-reserve")
+                        .long("withdraw-reserve")
+                        .value_name("RESERVE_PUBKEY")
+                        .takes_value(true)
+                        .required(true)
+                        .help("withdraw reserve"),
+                )
+                .arg(
+                    Arg::with_name("liquidity-amount")
+                        .long("liquidity-amount")
+                        .value_name("AMOUNT")
+                        .takes_value(true)
+                        .required(true)
+                        .help("amount of tokens to repay"),
+                )
+        )
+        .subcommand(
+            SubCommand::with_name("withdraw-collateral")
+                .about("Withdraw obligation collateral")
+                // @TODO: use is_valid_signer
+                .arg(
+                    Arg::with_name("obligation")
+                        .long("obligation")
+                        .value_name("OBLIGATION_PUBKEY")
+                        .takes_value(true)
+                        .required(true)
+                        .help("obligation pubkey"),
+                )
+                .arg(
+                    Arg::with_name("withdraw-reserve")
+                        .long("withdraw-reserve")
+                        .value_name("RESERVE_PUBKEY")
+                        .takes_value(true)
+                        .required(true)
+                        .help("reserve that you want to withdraw ctokens from"),
+                )
+                .arg(
+                    Arg::with_name("collateral-amount")
+                        .long("withdraw-amount")
+                        .value_name("AMOUNT")
+                        .takes_value(true)
+                        .required(true)
+                        .help("amount of ctokens to withdraw"),
+                )
+        )
+        .subcommand(
+            SubCommand::with_name("redeem-collateral")
+                .about("Redeem ctokens for tokens")
+                // @TODO: use is_valid_signer
+                .arg(
+                    Arg::with_name("redeem-reserve")
+                        .long("redeem-reserve")
+                        .value_name("RESERVE_PUBKEY")
+                        .takes_value(true)
+                        .required(true)
+                        .help("reserve pubkey"),
+                )
+                .arg(
+                    Arg::with_name("collateral-amount")
+                        .long("redeem-amount")
+                        .value_name("AMOUNT")
+                        .takes_value(true)
+                        .required(true)
+                        .help("amount of ctokens to redeem"),
+                )
         )
         .subcommand(
             SubCommand::with_name("add-reserve")
@@ -376,7 +498,16 @@ fn main() {
                         .takes_value(true)
                         .required(false)
                         .default_value("30")
-                        .help("Amount of liquidation bonus going to fee reciever: [0, 100]"),
+                        .help("Amount of liquidation bonus going to fee receiver: [0, 100]"),
+                )
+                .arg(
+                    Arg::with_name("protocol_take_rate")
+                        .long("protocol-take-rate")
+                        .validator(is_parsable::<u8>)
+                        .value_name("INTEGER_PERCENT")
+                        .takes_value(true)
+                        .required(false)
+                        .help("Amount of interest spread going to fee receiver: [0, 100]"),
                 )
                 .arg(
                     Arg::with_name("deposit_limit")
@@ -397,6 +528,55 @@ fn main() {
                         .required(true)
                         .default_value("18446744073709551615")
                         .help("Borrow limit"),
+                )
+        )
+        .subcommand(
+            SubCommand::with_name("set-lending-market-owner-and-config")
+                .about("Set lending market owner and config")
+                .arg(
+                    Arg::with_name("lending_market_owner")
+                        .long("market-owner")
+                        .validator(is_keypair)
+                        .value_name("KEYPAIR")
+                        .takes_value(true)
+                        .required(true)
+                        .help("Owner of the lending market"),
+                )
+                .arg(
+                    Arg::with_name("lending_market")
+                        .long("market")
+                        .validator(is_pubkey)
+                        .value_name("PUBKEY")
+                        .takes_value(true)
+                        .required(true)
+                        .help("Lending market address"),
+                )
+                .arg(
+                    Arg::with_name("new_lending_market_owner")
+                        .long("new-lending-market-owner")
+                        .validator(is_keypair)
+                        .value_name("KEYPAIR")
+                        .takes_value(true)
+                        .required(false)
+                        .help("Owner of the lending market"),
+                )
+                .arg(
+                    Arg::with_name("rate_limiter_window_duration")
+                        .long("rate-limiter-window-duration")
+                        .validator(is_parsable::<u64>)
+                        .value_name("INTEGER")
+                        .takes_value(true)
+                        .required(false)
+                        .help("Rate Limiter Window Duration in Slots"),
+                )
+                .arg(
+                    Arg::with_name("rate_limiter_max_outflow")
+                        .long("rate-limiter-max-outflow")
+                        .validator(is_parsable::<u64>)
+                        .value_name("INTEGER")
+                        .takes_value(true)
+                        .required(false)
+                        .help("Rate Limiter max outflow denominated in dollars within 1 window"),
                 )
         )
         .subcommand(
@@ -527,7 +707,16 @@ fn main() {
                         .value_name("INTEGER_PERCENT")
                         .takes_value(true)
                         .required(false)
-                        .help("Amount of liquidation bonus going to fee reciever: [0, 100]"),
+                        .help("Amount of liquidation bonus going to fee receiver: [0, 100]"),
+                )
+                .arg(
+                    Arg::with_name("protocol_take_rate")
+                        .long("protocol-take-rate")
+                        .validator(is_parsable::<u8>)
+                        .value_name("INTEGER_PERCENT")
+                        .takes_value(true)
+                        .required(false)
+                        .help("Amount of interest spread going to fee receiver: [0, 100]"),
                 )
                 .arg(
                     Arg::with_name("deposit_limit")
@@ -582,6 +771,33 @@ fn main() {
                         .takes_value(true)
                         .required(false)
                         .help("Switchboard price feed account: https://switchboard.xyz/#/explorer"),
+                )
+                .arg(
+                    Arg::with_name("rate_limiter_window_duration")
+                        .long("rate-limiter-window-duration")
+                        .validator(is_parsable::<u64>)
+                        .value_name("INTEGER")
+                        .takes_value(true)
+                        .required(false)
+                        .help("Rate Limiter Window Duration in Slots"),
+                )
+                .arg(
+                    Arg::with_name("rate_limiter_max_outflow")
+                        .long("rate-limiter-max-outflow")
+                        .validator(is_parsable::<u64>)
+                        .value_name("INTEGER")
+                        .takes_value(true)
+                        .required(false)
+                        .help("Rate Limiter max outflow of token amounts within 1 window"),
+                )
+                .arg(
+                    Arg::with_name("added_borrow_weight_bps")
+                        .long("added-borrow-weight-bps")
+                        .validator(is_parsable::<u64>)
+                        .value_name("INTEGER")
+                        .takes_value(true)
+                        .required(false)
+                        .help("Added borrow weight in basis points"),
                 )
         )
         .get_matches();
@@ -638,6 +854,35 @@ fn main() {
                 switchboard_oracle_program_id,
             )
         }
+        ("liquidate-obligation", Some(arg_matches)) => {
+            let obligation = pubkey_of(arg_matches, "obligation").unwrap();
+            let repay_reserve = pubkey_of(arg_matches, "repay-reserve").unwrap();
+            let source_liquidity = pubkey_of(arg_matches, "source-liquidity").unwrap();
+            let withdraw_reserve = pubkey_of(arg_matches, "withdraw-reserve").unwrap();
+            let liquidity_amount = value_of(arg_matches, "liquidity-amount").unwrap();
+
+            command_liquidate_obligation(
+                &config,
+                obligation,
+                repay_reserve,
+                source_liquidity,
+                withdraw_reserve,
+                liquidity_amount,
+            )
+        }
+        ("withdraw-collateral", Some(arg_matches)) => {
+            let obligation = pubkey_of(arg_matches, "obligation").unwrap();
+            let withdraw_reserve = pubkey_of(arg_matches, "withdraw-reserve").unwrap();
+            let collateral_amount = value_of(arg_matches, "collateral-amount").unwrap();
+
+            command_withdraw_collateral(&config, obligation, withdraw_reserve, collateral_amount)
+        }
+        ("redeem-collateral", Some(arg_matches)) => {
+            let redeem_reserve = pubkey_of(arg_matches, "redeem-reserve").unwrap();
+            let collateral_amount = value_of(arg_matches, "collateral-amount").unwrap();
+
+            command_redeem_collateral(&config, &redeem_reserve, collateral_amount)
+        }
         ("add-reserve", Some(arg_matches)) => {
             let lending_market_owner_keypair =
                 keypair_of(arg_matches, "lending_market_owner").unwrap();
@@ -669,6 +914,7 @@ fn main() {
             let liquidity_fee_receiver_keypair = Keypair::new();
             let protocol_liquidation_fee =
                 value_of(arg_matches, "protocol_liquidation_fee").unwrap();
+            let protocol_take_rate = value_of(arg_matches, "protocol_take_rate").unwrap();
 
             let source_liquidity_account = config
                 .rpc_client
@@ -707,6 +953,8 @@ fn main() {
                     borrow_limit,
                     fee_receiver: liquidity_fee_receiver_keypair.pubkey(),
                     protocol_liquidation_fee,
+                    protocol_take_rate,
+                    added_borrow_weight_bps: 10000,
                 },
                 source_liquidity_pubkey,
                 source_liquidity_owner_keypair,
@@ -717,6 +965,24 @@ fn main() {
                 switchboard_feed_pubkey,
                 liquidity_fee_receiver_keypair,
                 source_liquidity,
+            )
+        }
+        ("set-lending-market-owner-and-config", Some(arg_matches)) => {
+            let lending_market_owner_keypair =
+                keypair_of(arg_matches, "lending_market_owner").unwrap();
+            let lending_market_pubkey = pubkey_of(arg_matches, "lending_market").unwrap();
+            let new_lending_market_owner_keypair =
+                keypair_of(arg_matches, "new_lending_market_owner");
+            let rate_limiter_window_duration =
+                value_of(arg_matches, "rate_limiter_window_duration");
+            let rate_limiter_max_outflow = value_of(arg_matches, "rate_limiter_max_outflow");
+            command_set_lending_market_owner_and_config(
+                &mut config,
+                lending_market_pubkey,
+                lending_market_owner_keypair,
+                new_lending_market_owner_keypair,
+                rate_limiter_window_duration,
+                rate_limiter_max_outflow,
             )
         }
         ("update-reserve", Some(arg_matches)) => {
@@ -738,9 +1004,14 @@ fn main() {
             let borrow_limit = value_of(arg_matches, "borrow_limit");
             let fee_receiver = pubkey_of(arg_matches, "fee_receiver");
             let protocol_liquidation_fee = value_of(arg_matches, "protocol_liquidation_fee");
+            let protocol_take_rate = value_of(arg_matches, "protocol_take_rate");
             let pyth_product_pubkey = pubkey_of(arg_matches, "pyth_product");
             let pyth_price_pubkey = pubkey_of(arg_matches, "pyth_price");
             let switchboard_feed_pubkey = pubkey_of(arg_matches, "switchboard_feed");
+            let rate_limiter_window_duration =
+                value_of(arg_matches, "rate_limiter_window_duration");
+            let rate_limiter_max_outflow = value_of(arg_matches, "rate_limiter_max_outflow");
+            let added_borrow_weight_bps = value_of(arg_matches, "added_borrow_weight_bps");
 
             let borrow_fee_wad = borrow_fee.map(|fee| (fee * WAD as f64) as u64);
             let flash_loan_fee_wad = flash_loan_fee.map(|fee| (fee * WAD as f64) as u64);
@@ -764,6 +1035,10 @@ fn main() {
                     borrow_limit,
                     fee_receiver,
                     protocol_liquidation_fee,
+                    protocol_take_rate,
+                    rate_limiter_window_duration,
+                    rate_limiter_max_outflow,
+                    added_borrow_weight_bps,
                 },
                 pyth_product_pubkey,
                 pyth_price_pubkey,
@@ -800,7 +1075,9 @@ fn command_create_lending_market(
         .rpc_client
         .get_minimum_balance_for_rent_exemption(LendingMarket::LEN)?;
 
-    let mut transaction = Transaction::new_with_payer(
+    let recent_blockhash = config.rpc_client.get_latest_blockhash()?;
+
+    let message = Message::new_with_blockhash(
         &[
             // Account for the lending market
             create_account(
@@ -821,15 +1098,17 @@ fn command_create_lending_market(
             ),
         ],
         Some(&config.fee_payer.pubkey()),
+        &recent_blockhash,
     );
 
-    let (recent_blockhash, fee_calculator) = config.rpc_client.get_recent_blockhash()?;
     check_fee_payer_balance(
         config,
-        lending_market_balance + fee_calculator.calculate_fee(transaction.message()),
+        lending_market_balance + config.rpc_client.get_fee_for_message(&message)?,
     )?;
-    transaction.sign(
+
+    let transaction = Transaction::new(
         &vec![config.fee_payer.as_ref(), &lending_market_keypair],
+        message,
         recent_blockhash,
     );
     send_transaction(config, transaction)?;
@@ -842,6 +1121,215 @@ fn command_create_lending_market(
         "Authority Address {}",
         Pubkey::create_program_address(authority_signer_seeds, &config.lending_program_id)?,
     );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_redeem_collateral(
+    config: &Config,
+    redeem_reserve_pubkey: &Pubkey,
+    collateral_amount: u64,
+) -> CommandResult {
+    let redeem_reserve = {
+        let data = config
+            .rpc_client
+            .get_account(redeem_reserve_pubkey)
+            .unwrap();
+        Reserve::unpack(&data.data).unwrap()
+    };
+
+    let source_ata =
+        get_or_create_associated_token_address(config, &redeem_reserve.collateral.mint_pubkey);
+    let dest_ata =
+        get_or_create_associated_token_address(config, &redeem_reserve.liquidity.mint_pubkey);
+
+    let recent_blockhash = config.rpc_client.get_latest_blockhash()?;
+    let transaction = Transaction::new(
+        &vec![config.fee_payer.as_ref()],
+        Message::new_with_blockhash(
+            &[redeem_reserve_collateral(
+                config.lending_program_id,
+                collateral_amount,
+                source_ata,
+                dest_ata,
+                *redeem_reserve_pubkey,
+                redeem_reserve.collateral.mint_pubkey,
+                redeem_reserve.liquidity.supply_pubkey,
+                redeem_reserve.lending_market,
+                config.fee_payer.pubkey(),
+            )],
+            Some(&config.fee_payer.pubkey()),
+            &recent_blockhash,
+        ),
+        recent_blockhash,
+    );
+
+    send_transaction(config, transaction)?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_withdraw_collateral(
+    config: &Config,
+    obligation_pubkey: Pubkey,
+    withdraw_reserve_pubkey: Pubkey,
+    collateral_amount: u64,
+) -> CommandResult {
+    let solend_state = SolendState::new(
+        config.lending_program_id,
+        obligation_pubkey,
+        &config.rpc_client,
+    );
+
+    let withdraw_reserve = solend_state
+        .find_reserve_by_key(withdraw_reserve_pubkey)
+        .unwrap();
+
+    // make atas
+    get_or_create_associated_token_address(config, &withdraw_reserve.collateral.mint_pubkey);
+
+    let instructions = solend_state.withdraw(&withdraw_reserve_pubkey, collateral_amount);
+    let recent_blockhash = config.rpc_client.get_latest_blockhash()?;
+    let transaction = Transaction::new(
+        &vec![config.fee_payer.as_ref()],
+        Message::new_with_blockhash(
+            &instructions,
+            Some(&config.fee_payer.pubkey()),
+            &recent_blockhash,
+        ),
+        recent_blockhash,
+    );
+
+    send_transaction(config, transaction)?;
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn command_liquidate_obligation(
+    config: &Config,
+    obligation_pubkey: Pubkey,
+    repay_reserve_pubkey: Pubkey,
+    source_liquidity_pubkey: Pubkey,
+    withdraw_reserve_pubkey: Pubkey,
+    liquidity_amount: u64,
+) -> CommandResult {
+    let obligation_state = {
+        let data = config.rpc_client.get_account(&obligation_pubkey)?;
+        Obligation::unpack(&data.data)?
+    };
+
+    // get reserve pubkeys
+    let reserve_pubkeys = {
+        let mut r = Vec::new();
+        r.extend(obligation_state.deposits.iter().map(|d| d.deposit_reserve));
+        r.extend(obligation_state.borrows.iter().map(|b| b.borrow_reserve));
+        r
+    };
+
+    // get reserve accounts
+    let reserves: Vec<(Pubkey, Reserve)> = config
+        .rpc_client
+        .get_multiple_accounts(&reserve_pubkeys)?
+        .into_iter()
+        .zip(reserve_pubkeys.iter())
+        .map(|(account, pubkey)| (*pubkey, Reserve::unpack(&account.unwrap().data).unwrap()))
+        .collect();
+
+    assert!(reserve_pubkeys.len() == reserves.len());
+
+    // find repay, withdraw reserve states
+    let withdraw_reserve_state = reserves
+        .iter()
+        .find_map(|(pubkey, reserve)| {
+            if withdraw_reserve_pubkey == *pubkey {
+                Some(reserve)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let repay_reserve_state = reserves
+        .iter()
+        .find_map(|(pubkey, reserve)| {
+            if repay_reserve_pubkey == *pubkey {
+                Some(reserve)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+
+    // make sure atas exist. if they don't, create them.
+    let required_mints = [
+        withdraw_reserve_state.collateral.mint_pubkey,
+        withdraw_reserve_state.liquidity.mint_pubkey,
+    ];
+
+    for mint in required_mints {
+        get_or_create_associated_token_address(config, &mint);
+    }
+
+    let destination_collateral_pubkey = get_associated_token_address(
+        &config.fee_payer.pubkey(),
+        &withdraw_reserve_state.collateral.mint_pubkey,
+    );
+    let destination_liquidity_pubkey = get_associated_token_address(
+        &config.fee_payer.pubkey(),
+        &withdraw_reserve_state.liquidity.mint_pubkey,
+    );
+
+    let mut instructions = vec![ComputeBudgetInstruction::set_compute_unit_price(30101)];
+
+    // refresh all reserves
+    instructions.extend(reserves.iter().map(|(pubkey, reserve)| {
+        refresh_reserve(
+            config.lending_program_id,
+            *pubkey,
+            reserve.liquidity.pyth_oracle_pubkey,
+            reserve.liquidity.switchboard_oracle_pubkey,
+        )
+    }));
+
+    // refresh obligation
+    instructions.push(refresh_obligation(
+        config.lending_program_id,
+        obligation_pubkey,
+        reserve_pubkeys,
+    ));
+
+    instructions.push(liquidate_obligation_and_redeem_reserve_collateral(
+        config.lending_program_id,
+        liquidity_amount,
+        source_liquidity_pubkey,
+        destination_collateral_pubkey,
+        destination_liquidity_pubkey,
+        repay_reserve_pubkey,
+        repay_reserve_state.liquidity.supply_pubkey,
+        withdraw_reserve_pubkey,
+        withdraw_reserve_state.collateral.mint_pubkey,
+        withdraw_reserve_state.collateral.supply_pubkey,
+        withdraw_reserve_state.liquidity.supply_pubkey,
+        withdraw_reserve_state.config.fee_receiver,
+        obligation_pubkey,
+        obligation_state.lending_market,
+        config.fee_payer.pubkey(),
+    ));
+
+    let recent_blockhash = config.rpc_client.get_latest_blockhash()?;
+    let transaction = Transaction::new(
+        &vec![config.fee_payer.as_ref()],
+        Message::new_with_blockhash(
+            &instructions,
+            Some(&config.fee_payer.pubkey()),
+            &recent_blockhash,
+        ),
+        recent_blockhash,
+    );
+
+    send_transaction(config, transaction)?;
+
     Ok(())
 }
 
@@ -915,8 +1403,9 @@ fn command_add_reserve(
         + user_collateral_balance
         + liquidity_supply_balance
         + liquidity_fee_receiver_balance;
+    let recent_blockhash = config.rpc_client.get_latest_blockhash()?;
 
-    let mut transaction_1 = Transaction::new_with_payer(
+    let message_1 = Message::new_with_blockhash(
         &[
             create_account(
                 &config.fee_payer.pubkey(),
@@ -948,9 +1437,10 @@ fn command_add_reserve(
             ),
         ],
         Some(&config.fee_payer.pubkey()),
+        &recent_blockhash,
     );
 
-    let mut transaction_2 = Transaction::new_with_payer(
+    let message_2 = Message::new_with_blockhash(
         &[
             create_account(
                 &config.fee_payer.pubkey(),
@@ -968,9 +1458,10 @@ fn command_add_reserve(
             ),
         ],
         Some(&config.fee_payer.pubkey()),
+        &recent_blockhash,
     );
 
-    let mut transaction_3 = Transaction::new_with_payer(
+    let message_3 = Message::new_with_blockhash(
         &[
             approve(
                 &spl_token::id(),
@@ -1008,17 +1499,18 @@ fn command_add_reserve(
             .unwrap(),
         ],
         Some(&config.fee_payer.pubkey()),
+        &recent_blockhash,
     );
 
-    let (recent_blockhash, fee_calculator) = config.rpc_client.get_recent_blockhash()?;
     check_fee_payer_balance(
         config,
         total_balance
-            + fee_calculator.calculate_fee(transaction_1.message())
-            + fee_calculator.calculate_fee(transaction_2.message())
-            + fee_calculator.calculate_fee(transaction_3.message()),
+            + config.rpc_client.get_fee_for_message(&message_1)?
+            + config.rpc_client.get_fee_for_message(&message_2)?
+            + config.rpc_client.get_fee_for_message(&message_3)?,
     )?;
-    transaction_1.sign(
+
+    let transaction_1 = Transaction::new(
         &vec![
             config.fee_payer.as_ref(),
             &reserve_keypair,
@@ -1026,28 +1518,75 @@ fn command_add_reserve(
             &collateral_supply_keypair,
             &user_collateral_keypair,
         ],
+        message_1,
         recent_blockhash,
     );
-    transaction_2.sign(
+    send_transaction(config, transaction_1)?;
+    let transaction_2 = Transaction::new(
         &vec![
             config.fee_payer.as_ref(),
             &liquidity_supply_keypair,
             &liquidity_fee_receiver_keypair,
         ],
+        message_2,
         recent_blockhash,
     );
-    transaction_3.sign(
+    send_transaction(config, transaction_2)?;
+    let transaction_3 = Transaction::new(
         &vec![
             config.fee_payer.as_ref(),
             &source_liquidity_owner_keypair,
             &lending_market_owner_keypair,
             &user_transfer_authority_keypair,
         ],
+        message_3,
         recent_blockhash,
     );
-    send_transaction(config, transaction_1)?;
-    send_transaction(config, transaction_2)?;
     send_transaction(config, transaction_3)?;
+    Ok(())
+}
+
+fn command_set_lending_market_owner_and_config(
+    config: &mut Config,
+    lending_market_pubkey: Pubkey,
+    lending_market_owner_keypair: Keypair,
+    new_lending_market_owner_keypair: Option<Keypair>,
+    rate_limiter_window_duration: Option<u64>,
+    rate_limiter_max_outflow: Option<u64>,
+) -> CommandResult {
+    let lending_market_info = config.rpc_client.get_account(&lending_market_pubkey)?;
+    let lending_market = LendingMarket::unpack_from_slice(lending_market_info.data.borrow())?;
+    println!("{:#?}", lending_market);
+
+    let recent_blockhash = config.rpc_client.get_latest_blockhash()?;
+    let message = Message::new_with_blockhash(
+        &[set_lending_market_owner_and_config(
+            config.lending_program_id,
+            lending_market_pubkey,
+            lending_market_owner_keypair.pubkey(),
+            if let Some(owner) = new_lending_market_owner_keypair {
+                owner.pubkey()
+            } else {
+                lending_market.owner
+            },
+            RateLimiterConfig {
+                window_duration: rate_limiter_window_duration
+                    .unwrap_or(lending_market.rate_limiter.config.window_duration),
+                max_outflow: rate_limiter_max_outflow
+                    .unwrap_or(lending_market.rate_limiter.config.max_outflow),
+            },
+        )],
+        Some(&config.fee_payer.pubkey()),
+        &recent_blockhash,
+    );
+
+    let transaction = Transaction::new(
+        &vec![config.fee_payer.as_ref(), &lending_market_owner_keypair],
+        message,
+        recent_blockhash,
+    );
+
+    send_transaction(config, transaction)?;
     Ok(())
 }
 
@@ -1064,7 +1603,13 @@ fn command_update_reserve(
 ) -> CommandResult {
     let reserve_info = config.rpc_client.get_account(&reserve_pubkey)?;
     let mut reserve = Reserve::unpack_from_slice(reserve_info.data.borrow())?;
-    if reserve_config.optimal_utilization_rate.is_some() {
+    println!("Reserve: {:#?}", reserve);
+    let mut no_change = true;
+    if reserve_config.optimal_utilization_rate.is_some()
+        && reserve.config.optimal_utilization_rate
+            != reserve_config.optimal_utilization_rate.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating optimal_utilization_rate from {} to {}",
             reserve.config.optimal_utilization_rate,
@@ -1073,7 +1618,10 @@ fn command_update_reserve(
         reserve.config.optimal_utilization_rate = reserve_config.optimal_utilization_rate.unwrap();
     }
 
-    if reserve_config.loan_to_value_ratio.is_some() {
+    if reserve_config.loan_to_value_ratio.is_some()
+        && reserve.config.loan_to_value_ratio != reserve_config.loan_to_value_ratio.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating loan_to_value_ratio from {} to {}",
             reserve.config.loan_to_value_ratio,
@@ -1082,7 +1630,10 @@ fn command_update_reserve(
         reserve.config.loan_to_value_ratio = reserve_config.loan_to_value_ratio.unwrap();
     }
 
-    if reserve_config.liquidation_bonus.is_some() {
+    if reserve_config.liquidation_bonus.is_some()
+        && reserve.config.liquidation_bonus != reserve_config.liquidation_bonus.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating liquidation_bonus from {} to {}",
             reserve.config.liquidation_bonus,
@@ -1091,7 +1642,10 @@ fn command_update_reserve(
         reserve.config.liquidation_bonus = reserve_config.liquidation_bonus.unwrap();
     }
 
-    if reserve_config.liquidation_threshold.is_some() {
+    if reserve_config.liquidation_threshold.is_some()
+        && reserve.config.liquidation_threshold != reserve_config.liquidation_threshold.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating liquidation_threshold from {} to {}",
             reserve.config.liquidation_threshold,
@@ -1100,7 +1654,10 @@ fn command_update_reserve(
         reserve.config.liquidation_threshold = reserve_config.liquidation_threshold.unwrap();
     }
 
-    if reserve_config.min_borrow_rate.is_some() {
+    if reserve_config.min_borrow_rate.is_some()
+        && reserve.config.min_borrow_rate != reserve_config.min_borrow_rate.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating min_borrow_rate from {} to {}",
             reserve.config.min_borrow_rate,
@@ -1109,7 +1666,10 @@ fn command_update_reserve(
         reserve.config.min_borrow_rate = reserve_config.min_borrow_rate.unwrap();
     }
 
-    if reserve_config.optimal_borrow_rate.is_some() {
+    if reserve_config.optimal_borrow_rate.is_some()
+        && reserve.config.optimal_borrow_rate != reserve_config.optimal_borrow_rate.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating optimal_borrow_rate from {} to {}",
             reserve.config.optimal_borrow_rate,
@@ -1118,7 +1678,10 @@ fn command_update_reserve(
         reserve.config.optimal_borrow_rate = reserve_config.optimal_borrow_rate.unwrap();
     }
 
-    if reserve_config.max_borrow_rate.is_some() {
+    if reserve_config.max_borrow_rate.is_some()
+        && reserve.config.max_borrow_rate != reserve_config.max_borrow_rate.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating max_borrow_rate from {} to {}",
             reserve.config.max_borrow_rate,
@@ -1127,7 +1690,10 @@ fn command_update_reserve(
         reserve.config.max_borrow_rate = reserve_config.max_borrow_rate.unwrap();
     }
 
-    if reserve_config.fees.borrow_fee_wad.is_some() {
+    if reserve_config.fees.borrow_fee_wad.is_some()
+        && reserve.config.fees.borrow_fee_wad != reserve_config.fees.borrow_fee_wad.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating borrow_fee_wad from {} to {}",
             reserve.config.fees.borrow_fee_wad,
@@ -1136,7 +1702,10 @@ fn command_update_reserve(
         reserve.config.fees.borrow_fee_wad = reserve_config.fees.borrow_fee_wad.unwrap();
     }
 
-    if reserve_config.fees.flash_loan_fee_wad.is_some() {
+    if reserve_config.fees.flash_loan_fee_wad.is_some()
+        && reserve.config.fees.flash_loan_fee_wad != reserve_config.fees.flash_loan_fee_wad.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating flash_loan_fee_wad from {} to {}",
             reserve.config.fees.flash_loan_fee_wad,
@@ -1145,7 +1714,11 @@ fn command_update_reserve(
         reserve.config.fees.flash_loan_fee_wad = reserve_config.fees.flash_loan_fee_wad.unwrap();
     }
 
-    if reserve_config.fees.host_fee_percentage.is_some() {
+    if reserve_config.fees.host_fee_percentage.is_some()
+        && reserve.config.fees.host_fee_percentage
+            != reserve_config.fees.host_fee_percentage.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating host_fee_percentage from {} to {}",
             reserve.config.fees.host_fee_percentage,
@@ -1154,7 +1727,10 @@ fn command_update_reserve(
         reserve.config.fees.host_fee_percentage = reserve_config.fees.host_fee_percentage.unwrap();
     }
 
-    if reserve_config.deposit_limit.is_some() {
+    if reserve_config.deposit_limit.is_some()
+        && reserve.config.deposit_limit != reserve_config.deposit_limit.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating deposit_limit from {} to {}",
             amount_to_ui_amount(
@@ -1169,7 +1745,10 @@ fn command_update_reserve(
         )
     }
 
-    if reserve_config.borrow_limit.is_some() {
+    if reserve_config.borrow_limit.is_some()
+        && reserve.config.borrow_limit != reserve_config.borrow_limit.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating borrow_limit from {} to {}",
             amount_to_ui_amount(reserve.config.borrow_limit, reserve.liquidity.mint_decimals),
@@ -1181,7 +1760,10 @@ fn command_update_reserve(
         )
     }
 
-    if reserve_config.fee_receiver.is_some() {
+    if reserve_config.fee_receiver.is_some()
+        && reserve.config.fee_receiver != reserve_config.fee_receiver.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating fee_receiver from {} to {}",
             reserve.config.fee_receiver,
@@ -1190,7 +1772,11 @@ fn command_update_reserve(
         reserve.config.fee_receiver = reserve_config.fee_receiver.unwrap();
     }
 
-    if reserve_config.protocol_liquidation_fee.is_some() {
+    if reserve_config.protocol_liquidation_fee.is_some()
+        && reserve.config.protocol_liquidation_fee
+            != reserve_config.protocol_liquidation_fee.unwrap()
+    {
+        no_change = false;
         println!(
             "Updating protocol_liquidation_fee from {} to {}",
             reserve.config.protocol_liquidation_fee,
@@ -1199,8 +1785,21 @@ fn command_update_reserve(
         reserve.config.protocol_liquidation_fee = reserve_config.protocol_liquidation_fee.unwrap();
     }
 
-    let mut new_pyth_product_pubkey = solend_program::NULL_PUBKEY;
+    if reserve_config.protocol_take_rate.is_some()
+        && reserve.config.protocol_take_rate != reserve_config.protocol_take_rate.unwrap()
+    {
+        no_change = false;
+        println!(
+            "Updating protocol_take_rate from {} to {}",
+            reserve.config.protocol_take_rate,
+            reserve_config.protocol_take_rate.unwrap(),
+        );
+        reserve.config.protocol_take_rate = reserve_config.protocol_take_rate.unwrap();
+    }
+
+    let mut new_pyth_product_pubkey = solend_sdk::NULL_PUBKEY;
     if pyth_price_pubkey.is_some() {
+        no_change = false;
         println!(
             "Updating pyth oracle pubkey from {} to {}",
             reserve.liquidity.pyth_oracle_pubkey,
@@ -1211,6 +1810,7 @@ fn command_update_reserve(
     }
 
     if switchboard_feed_pubkey.is_some() {
+        no_change = false;
         println!(
             "Updating switchboard_oracle_pubkey {} to {}",
             reserve.liquidity.switchboard_oracle_pubkey,
@@ -1219,10 +1819,60 @@ fn command_update_reserve(
         reserve.liquidity.switchboard_oracle_pubkey = switchboard_feed_pubkey.unwrap();
     }
 
-    let mut transaction = Transaction::new_with_payer(
+    if reserve_config.rate_limiter_window_duration.is_some()
+        && reserve.rate_limiter.config.window_duration
+            != reserve_config.rate_limiter_window_duration.unwrap()
+    {
+        no_change = false;
+        println!(
+            "Updating rate_limiter_window_duration from {} to {}",
+            reserve.rate_limiter.config.window_duration,
+            reserve_config.rate_limiter_window_duration.unwrap(),
+        );
+        reserve.rate_limiter.config.window_duration =
+            reserve_config.rate_limiter_window_duration.unwrap();
+    }
+
+    if reserve_config.rate_limiter_max_outflow.is_some()
+        && reserve.rate_limiter.config.max_outflow
+            != reserve_config.rate_limiter_max_outflow.unwrap()
+    {
+        no_change = false;
+        println!(
+            "Updating rate_limiter_max_outflow from {} to {}",
+            reserve.rate_limiter.config.max_outflow,
+            reserve_config.rate_limiter_max_outflow.unwrap(),
+        );
+        reserve.rate_limiter.config.max_outflow = reserve_config.rate_limiter_max_outflow.unwrap();
+    }
+
+    if reserve_config.added_borrow_weight_bps.is_some()
+        && reserve.config.added_borrow_weight_bps != reserve_config.added_borrow_weight_bps.unwrap()
+    {
+        no_change = false;
+        println!(
+            "Updating added_borrow_weight_bps from {} to {}",
+            reserve.config.added_borrow_weight_bps,
+            reserve_config.added_borrow_weight_bps.unwrap(),
+        );
+        reserve.config.added_borrow_weight_bps = reserve_config.added_borrow_weight_bps.unwrap();
+    }
+
+    if no_change {
+        println!("No changes made for reserve {}", reserve_pubkey);
+        return Ok(());
+    }
+
+    let recent_blockhash = config.rpc_client.get_latest_blockhash()?;
+
+    let message = Message::new_with_blockhash(
         &[update_reserve_config(
             config.lending_program_id,
             reserve.config,
+            RateLimiterConfig {
+                window_duration: reserve.rate_limiter.config.window_duration,
+                max_outflow: reserve.rate_limiter.config.max_outflow,
+            },
             reserve_pubkey,
             lending_market_pubkey,
             lending_market_owner_keypair.pubkey(),
@@ -1231,15 +1881,15 @@ fn command_update_reserve(
             reserve.liquidity.switchboard_oracle_pubkey,
         )],
         Some(&config.fee_payer.pubkey()),
+        &recent_blockhash,
     );
 
-    let (recent_blockhash, fee_calculator) = config.rpc_client.get_recent_blockhash()?;
-    check_fee_payer_balance(config, fee_calculator.calculate_fee(transaction.message()))?;
-
-    transaction.sign(
+    let transaction = Transaction::new(
         &vec![config.fee_payer.as_ref(), &lending_market_owner_keypair],
+        message,
         recent_blockhash,
     );
+
     send_transaction(config, transaction)?;
     Ok(())
 }
@@ -1271,7 +1921,17 @@ fn send_transaction(
     } else {
         let signature = config
             .rpc_client
-            .send_and_confirm_transaction_with_spinner(&transaction)?;
+            .send_and_confirm_transaction_with_spinner_and_config(
+                &transaction,
+                CommitmentConfig::confirmed(),
+                RpcSendTransactionConfig {
+                    preflight_commitment: Some(CommitmentLevel::Processed),
+                    skip_preflight: true,
+                    encoding: None,
+                    max_retries: None,
+                    min_context_slot: None,
+                },
+            )?;
         println!("Signature: {}", signature);
     }
     Ok(())
@@ -1291,4 +1951,32 @@ fn quote_currency_of(matches: &ArgMatches<'_>, name: &str) -> Option<[u8; 32]> {
     } else {
         None
     }
+}
+
+fn get_or_create_associated_token_address(config: &Config, mint: &Pubkey) -> Pubkey {
+    let ata = get_associated_token_address(&config.fee_payer.pubkey(), mint);
+
+    if config.rpc_client.get_account(&ata).is_err() {
+        println!("Creating ATA for mint {:?}", mint);
+
+        let recent_blockhash = config.rpc_client.get_latest_blockhash().unwrap();
+        let transaction = Transaction::new(
+            &vec![config.fee_payer.as_ref()],
+            Message::new_with_blockhash(
+                &[create_associated_token_account(
+                    &config.fee_payer.pubkey(),
+                    &config.fee_payer.pubkey(),
+                    mint,
+                    &spl_associated_token_account::id(),
+                )],
+                Some(&config.fee_payer.pubkey()),
+                &recent_blockhash,
+            ),
+            recent_blockhash,
+        );
+
+        send_transaction(config, transaction).unwrap();
+    }
+
+    ata
 }

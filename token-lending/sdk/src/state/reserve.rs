@@ -13,7 +13,7 @@ use solana_program::{
     pubkey::{Pubkey, PUBKEY_BYTES},
 };
 use std::{
-    cmp::{min, Ordering},
+    cmp::{max, min, Ordering},
     convert::{TryFrom, TryInto},
 };
 
@@ -41,6 +41,8 @@ pub struct Reserve {
     pub collateral: ReserveCollateral,
     /// Reserve configuration values
     pub config: ReserveConfig,
+    /// Outflow Rate Limiter (denominated in tokens)
+    pub rate_limiter: RateLimiter,
 }
 
 impl Reserve {
@@ -59,6 +61,71 @@ impl Reserve {
         self.liquidity = params.liquidity;
         self.collateral = params.collateral;
         self.config = params.config;
+        self.rate_limiter = RateLimiter::new(params.rate_limiter_config, params.current_slot);
+    }
+
+    /// get borrow weight. Guaranteed to be greater than 1
+    pub fn borrow_weight(&self) -> Decimal {
+        Decimal::one()
+            .try_add(Decimal::from_bps(self.config.added_borrow_weight_bps))
+            .unwrap()
+    }
+
+    /// get loan to value ratio as a Rate
+    pub fn loan_to_value_ratio(&self) -> Rate {
+        Rate::from_percent(self.config.loan_to_value_ratio)
+    }
+
+    /// find current market value of tokens
+    pub fn market_value(&self, liquidity_amount: Decimal) -> Result<Decimal, ProgramError> {
+        self.liquidity
+            .market_price
+            .try_mul(liquidity_amount)?
+            .try_div(Decimal::from(
+                (10u128)
+                    .checked_pow(self.liquidity.mint_decimals as u32)
+                    .ok_or(LendingError::MathOverflow)?,
+            ))
+    }
+
+    /// find the current upper bound market value of tokens.
+    /// ie max(market_price, smoothed_market_price) * liquidity_amount
+    pub fn market_value_upper_bound(
+        &self,
+        liquidity_amount: Decimal,
+    ) -> Result<Decimal, ProgramError> {
+        let price_upper_bound = std::cmp::max(
+            self.liquidity.market_price,
+            self.liquidity.smoothed_market_price,
+        );
+
+        price_upper_bound
+            .try_mul(liquidity_amount)?
+            .try_div(Decimal::from(
+                (10u128)
+                    .checked_pow(self.liquidity.mint_decimals as u32)
+                    .ok_or(LendingError::MathOverflow)?,
+            ))
+    }
+
+    /// find the current lower bound market value of tokens.
+    /// ie min(market_price, smoothed_market_price) * liquidity_amount
+    pub fn market_value_lower_bound(
+        &self,
+        liquidity_amount: Decimal,
+    ) -> Result<Decimal, ProgramError> {
+        let price_lower_bound = std::cmp::min(
+            self.liquidity.market_price,
+            self.liquidity.smoothed_market_price,
+        );
+
+        price_lower_bound
+            .try_mul(liquidity_amount)?
+            .try_div(Decimal::from(
+                (10u128)
+                    .checked_pow(self.liquidity.mint_decimals as u32)
+                    .ok_or(LendingError::MathOverflow)?,
+            ))
     }
 
     /// Record deposited liquidity and return amount of collateral tokens to mint
@@ -168,7 +235,11 @@ impl Reserve {
         if amount_to_borrow == u64::MAX {
             let borrow_amount = max_borrow_value
                 .try_mul(decimals)?
-                .try_div(self.liquidity.market_price)?
+                .try_div(max(
+                    self.liquidity.market_price,
+                    self.liquidity.smoothed_market_price,
+                ))?
+                .try_div(self.borrow_weight())?
                 .min(remaining_reserve_borrow)
                 .min(self.liquidity.available_amount.into());
             let (borrow_fee, host_fee) = self
@@ -195,9 +266,9 @@ impl Reserve {
                 .calculate_borrow_fees(borrow_amount, FeeCalculation::Exclusive)?;
 
             let borrow_amount = borrow_amount.try_add(borrow_fee.into())?;
-            let borrow_value = borrow_amount
-                .try_mul(self.liquidity.market_price)?
-                .try_div(decimals)?;
+            let borrow_value = self
+                .market_value_upper_bound(borrow_amount)?
+                .try_mul(self.borrow_weight())?;
             if borrow_value > max_borrow_value {
                 msg!("Borrow value cannot exceed maximum borrow value");
                 return Err(LendingError::BorrowTooLarge.into());
@@ -327,8 +398,12 @@ impl Reserve {
         let bonus = amount_liquidated_wads.try_sub(amount_liquidated_wads.try_div(bonus_rate)?)?;
 
         // After deploying must update all reserves to set liquidation fee then redeploy with this line instead of hardcode
-        // let protocol_fee = max(bonus.try_mul(Rate::from_percent(self.config.protocol_liquidation_fee))?.try_ceil_u64()?, 1);
-        let protocol_fee = std::cmp::max(bonus.try_mul(Rate::from_percent(0))?.try_ceil_u64()?, 1);
+        let protocol_fee = std::cmp::max(
+            bonus
+                .try_mul(Rate::from_percent(self.config.protocol_liquidation_fee))?
+                .try_ceil_u64()?,
+            1,
+        );
         Ok(protocol_fee)
     }
 
@@ -355,10 +430,12 @@ pub struct InitReserveParams {
     pub collateral: ReserveCollateral,
     /// Reserve configuration values
     pub config: ReserveConfig,
+    /// rate limiter config
+    pub rate_limiter_config: RateLimiterConfig,
 }
 
 /// Calculate borrow result
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalculateBorrowResult {
     /// Total amount of borrow including fees
     pub borrow_amount: Decimal,
@@ -380,7 +457,7 @@ pub struct CalculateRepayResult {
 }
 
 /// Calculate liquidation result
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalculateLiquidationResult {
     /// Amount of liquidity that is settled from the obligation. It includes
     /// the amount of loan that was defaulted if collateral is depleted.
@@ -392,7 +469,7 @@ pub struct CalculateLiquidationResult {
 }
 
 /// Reserve liquidity
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReserveLiquidity {
     /// Reserve liquidity mint address
     pub mint_pubkey: Pubkey,
@@ -414,6 +491,8 @@ pub struct ReserveLiquidity {
     pub accumulated_protocol_fees_wads: Decimal,
     /// Reserve liquidity market price in quote currency
     pub market_price: Decimal,
+    /// Smoothed reserve liquidity market price for the liquidity (eg TWAP, VWAP, EMA)
+    pub smoothed_market_price: Decimal,
 }
 
 impl ReserveLiquidity {
@@ -430,6 +509,7 @@ impl ReserveLiquidity {
             cumulative_borrow_rate_wads: Decimal::one(),
             accumulated_protocol_fees_wads: Decimal::zero(),
             market_price: params.market_price,
+            smoothed_market_price: params.smoothed_market_price,
         }
     }
 
@@ -507,10 +587,13 @@ impl ReserveLiquidity {
     /// Calculate the liquidity utilization rate of the reserve
     pub fn utilization_rate(&self) -> Result<Rate, ProgramError> {
         let total_supply = self.total_supply()?;
-        if total_supply == Decimal::zero() {
+        if total_supply == Decimal::zero() || self.borrowed_amount_wads == Decimal::zero() {
             return Ok(Rate::zero());
         }
-        self.borrowed_amount_wads.try_div(total_supply)?.try_into()
+        let denominator = self
+            .borrowed_amount_wads
+            .try_add(Decimal::from(self.available_amount))?;
+        self.borrowed_amount_wads.try_div(denominator)?.try_into()
     }
 
     /// Compound current borrow rate over elapsed slots
@@ -556,10 +639,12 @@ pub struct NewReserveLiquidityParams {
     pub switchboard_oracle_pubkey: Pubkey,
     /// Reserve liquidity market price in quote currency
     pub market_price: Decimal,
+    /// Smoothed reserve liquidity market price in quote currency
+    pub smoothed_market_price: Decimal,
 }
 
 /// Reserve collateral
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ReserveCollateral {
     /// Reserve collateral mint address
     pub mint_pubkey: Pubkey,
@@ -662,7 +747,7 @@ impl From<CollateralExchangeRate> for Rate {
 }
 
 /// Reserve configuration values
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReserveConfig {
     /// Optimal utilization rate, as a percentage
     pub optimal_utilization_rate: u8,
@@ -691,6 +776,9 @@ pub struct ReserveConfig {
     pub protocol_liquidation_fee: u8,
     /// Protocol take rate is the amount borrowed interest protocol recieves, as a percentage  
     pub protocol_take_rate: u8,
+    /// Added borrow weight in basis points. THIS FIELD SHOULD NEVER BE USED DIRECTLY. Always use
+    /// borrow_weight()
+    pub added_borrow_weight_bps: u64,
 }
 
 /// Additional fee information on a reserve
@@ -698,7 +786,7 @@ pub struct ReserveConfig {
 /// These exist separately from interest accrual fees, and are specifically for the program owner
 /// and frontend host. The fees are paid out as a percentage of liquidity token amounts during
 /// repayments and liquidations.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ReserveFees {
     /// Fee assessed on `BorrowObligationLiquidity`, expressed as a Wad.
     /// Must be between 0 and 10^18, such that 10^18 = 1.  A few examples for
@@ -729,11 +817,16 @@ impl ReserveFees {
         &self,
         flash_loan_amount: Decimal,
     ) -> Result<(u64, u64), ProgramError> {
-        self.calculate_fees(
+        let (total_fees, host_fee) = self.calculate_fees(
             flash_loan_amount,
             self.flash_loan_fee_wad,
             FeeCalculation::Exclusive,
-        )
+        )?;
+
+        let origination_fee = total_fees
+            .checked_sub(host_fee)
+            .ok_or(LendingError::MathOverflow)?;
+        Ok((origination_fee, host_fee))
     }
 
     fn calculate_fees(
@@ -842,6 +935,9 @@ impl Pack for Reserve {
             config_protocol_liquidation_fee,
             config_protocol_take_rate,
             liquidity_accumulated_protocol_fees_wads,
+            rate_limiter,
+            config_added_borrow_weight_bps,
+            liquidity_smoothed_market_price,
             _padding,
         ) = mut_array_refs![
             output,
@@ -877,7 +973,10 @@ impl Pack for Reserve {
             1,
             1,
             16,
-            230
+            RATE_LIMITER_LEN,
+            8,
+            16,
+            150
         ];
 
         // reserve
@@ -907,6 +1006,10 @@ impl Pack for Reserve {
             liquidity_accumulated_protocol_fees_wads,
         );
         pack_decimal(self.liquidity.market_price, liquidity_market_price);
+        pack_decimal(
+            self.liquidity.smoothed_market_price,
+            liquidity_smoothed_market_price,
+        );
 
         // collateral
         collateral_mint_pubkey.copy_from_slice(self.collateral.mint_pubkey.as_ref());
@@ -929,6 +1032,10 @@ impl Pack for Reserve {
         config_fee_receiver.copy_from_slice(self.config.fee_receiver.as_ref());
         *config_protocol_liquidation_fee = self.config.protocol_liquidation_fee.to_le_bytes();
         *config_protocol_take_rate = self.config.protocol_take_rate.to_le_bytes();
+
+        self.rate_limiter.pack_into_slice(rate_limiter);
+
+        *config_added_borrow_weight_bps = self.config.added_borrow_weight_bps.to_le_bytes();
     }
 
     /// Unpacks a byte buffer into a [ReserveInfo](struct.ReserveInfo.html).
@@ -968,6 +1075,9 @@ impl Pack for Reserve {
             config_protocol_liquidation_fee,
             config_protocol_take_rate,
             liquidity_accumulated_protocol_fees_wads,
+            rate_limiter,
+            config_added_borrow_weight_bps,
+            liquidity_smoothed_market_price,
             _padding,
         ) = array_refs![
             input,
@@ -1003,7 +1113,10 @@ impl Pack for Reserve {
             1,
             1,
             16,
-            230
+            RATE_LIMITER_LEN,
+            8,
+            16,
+            150
         ];
 
         let version = u8::from_le_bytes(*version);
@@ -1034,6 +1147,7 @@ impl Pack for Reserve {
                     liquidity_accumulated_protocol_fees_wads,
                 ),
                 market_price: unpack_decimal(liquidity_market_price),
+                smoothed_market_price: unpack_decimal(liquidity_smoothed_market_price),
             },
             collateral: ReserveCollateral {
                 mint_pubkey: Pubkey::new_from_array(*collateral_mint_pubkey),
@@ -1058,7 +1172,9 @@ impl Pack for Reserve {
                 fee_receiver: Pubkey::new_from_array(*config_fee_receiver),
                 protocol_liquidation_fee: u8::from_le_bytes(*config_protocol_liquidation_fee),
                 protocol_take_rate: u8::from_le_bytes(*config_protocol_take_rate),
+                added_borrow_weight_bps: u64::from_le_bytes(*config_added_borrow_weight_bps),
             },
+            rate_limiter: RateLimiter::unpack_from_slice(rate_limiter)?,
         })
     }
 }
@@ -1068,7 +1184,9 @@ mod test {
     use super::*;
     use crate::math::{PERCENT_SCALER, WAD};
     use proptest::prelude::*;
+    use solana_program::native_token::LAMPORTS_PER_SOL;
     use std::cmp::Ordering;
+    use std::default::Default;
 
     const MAX_LIQUIDITY: u64 = u64::MAX / 5;
 
@@ -1325,25 +1443,22 @@ mod test {
                 flash_loan_fee_wad,
                 host_fee_percentage,
             };
-            let (total_fee, host_fee) = fees.calculate_flash_loan_fees(Decimal::from(borrow_amount))?;
+            let (origination_fee, host_fee) = fees.calculate_flash_loan_fees(Decimal::from(borrow_amount))?;
 
             // The total fee can't be greater than the amount borrowed, as long
             // as amount borrowed is greater than 2.
             // At a borrow amount of 2, we can get a total fee of 2 if a host
             // fee is also specified.
-            assert!(total_fee <= borrow_amount);
-
-            // the host fee can't be greater than the total fee
-            assert!(host_fee <= total_fee);
+            assert!(origination_fee + host_fee <= borrow_amount);
 
             // for all fee rates greater than 0, we must have some fee
             if borrow_fee_wad > 0 {
-                assert!(total_fee > 0);
+                assert!(origination_fee + host_fee > 0);
             }
 
             if host_fee_percentage == 100 {
                 // if the host fee percentage is maxed at 100%, it should get all the fee
-                assert_eq!(host_fee, total_fee);
+                assert_eq!(origination_fee, 0);
             }
 
             // if there's a host fee and some borrow fee, host fee must be greater than 0
@@ -1442,5 +1557,350 @@ mod test {
 
         assert_eq!(total_fee, 10); // 1% of 1000
         assert_eq!(host_fee, 0); // 0 host fee
+    }
+
+    #[derive(Debug, Clone)]
+    struct LiquidationTestCase {
+        deposit_amount: u64,
+        deposit_market_value: u64,
+        borrow_amount: u64,
+        borrow_market_value: u64,
+        liquidation_result: CalculateLiquidationResult,
+    }
+
+    fn calculate_liquidation_test_cases() -> impl Strategy<Value = LiquidationTestCase> {
+        let close_factor: Decimal = Rate::from_percent(LIQUIDATION_CLOSE_FACTOR)
+            .try_into()
+            .unwrap();
+        let liquidation_bonus: Decimal = Rate::from_percent(5)
+            .try_add(Rate::one())
+            .unwrap()
+            .try_into()
+            .unwrap();
+
+        prop_oneof![
+            // collateral market value > liquidation value
+            Just(LiquidationTestCase {
+                deposit_amount: 1000,
+                deposit_market_value: 100,
+                borrow_amount: 800,
+                borrow_market_value: 80,
+                liquidation_result: CalculateLiquidationResult {
+                    settle_amount: close_factor.try_mul(Decimal::from(800u64)).unwrap(),
+                    repay_amount: close_factor
+                        .try_mul(Decimal::from(800u64))
+                        .unwrap()
+                        .try_ceil_u64()
+                        .unwrap(),
+                    withdraw_amount: close_factor
+                        .try_mul(liquidation_bonus)
+                        .unwrap()
+                        .try_mul(Decimal::from(800u64))
+                        .unwrap()
+                        .try_floor_u64()
+                        .unwrap(),
+                },
+            }),
+            // collateral market value == liquidation_value
+            Just(LiquidationTestCase {
+                borrow_amount: 8000,
+                borrow_market_value: 8000,
+                deposit_amount: (8000 * LIQUIDATION_CLOSE_FACTOR as u64) * 105 / 10000,
+                deposit_market_value: (8000 * LIQUIDATION_CLOSE_FACTOR as u64) * 105 / 10000,
+
+                liquidation_result: CalculateLiquidationResult {
+                    settle_amount: Decimal::from((8000 * LIQUIDATION_CLOSE_FACTOR as u64) / 100),
+                    repay_amount: (8000 * LIQUIDATION_CLOSE_FACTOR as u64) / 100,
+                    withdraw_amount: (8000 * LIQUIDATION_CLOSE_FACTOR as u64) * 105 / 10000,
+                },
+            }),
+            // collateral market value < liquidation_value
+            Just(LiquidationTestCase {
+                borrow_amount: 8000,
+                borrow_market_value: 8000,
+
+                // half of liquidation value
+                deposit_amount: (8000 * LIQUIDATION_CLOSE_FACTOR as u64) * 105 / 10000 / 2,
+                deposit_market_value: (8000 * LIQUIDATION_CLOSE_FACTOR as u64) * 105 / 10000 / 2,
+
+                liquidation_result: CalculateLiquidationResult {
+                    settle_amount: Decimal::from(
+                        (8000 * LIQUIDATION_CLOSE_FACTOR as u64) / 100 / 2
+                    ),
+                    repay_amount: (8000 * LIQUIDATION_CLOSE_FACTOR as u64) / 100 / 2,
+                    withdraw_amount: (8000 * LIQUIDATION_CLOSE_FACTOR as u64) * 105 / 10000 / 2,
+                },
+            }),
+            // dust ObligationLiquidity where collateral market value > liquidation value
+            Just(LiquidationTestCase {
+                borrow_amount: 1,
+                borrow_market_value: 1000,
+                deposit_amount: 1000,
+                deposit_market_value: 2100,
+
+                liquidation_result: CalculateLiquidationResult {
+                    settle_amount: Decimal::from(1u64),
+                    repay_amount: 1,
+                    withdraw_amount: 500,
+                },
+            }),
+            // dust ObligationLiquidity where collateral market value == liquidation value
+            Just(LiquidationTestCase {
+                borrow_amount: 1,
+                borrow_market_value: 1000,
+                deposit_amount: 1000,
+                deposit_market_value: 1050,
+
+                liquidation_result: CalculateLiquidationResult {
+                    settle_amount: Decimal::from(1u64),
+                    repay_amount: 1,
+                    withdraw_amount: 1000,
+                },
+            }),
+            // dust ObligationLiquidity where collateral market value < liquidation value
+            Just(LiquidationTestCase {
+                borrow_amount: 1,
+                borrow_market_value: 1000,
+                deposit_amount: 1000,
+                deposit_market_value: 1000,
+
+                liquidation_result: CalculateLiquidationResult {
+                    settle_amount: Decimal::from(1u64),
+                    repay_amount: 1,
+                    withdraw_amount: 1000,
+                },
+            }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn calculate_liquidation(test_case in calculate_liquidation_test_cases()) {
+            let reserve = Reserve {
+                config: ReserveConfig {
+                    liquidation_bonus: 5,
+                    ..ReserveConfig::default()
+                },
+                ..Reserve::default()
+            };
+
+            let obligation = Obligation {
+                deposits: vec![ObligationCollateral {
+                    deposit_reserve: Pubkey::new_unique(),
+                    deposited_amount: test_case.deposit_amount,
+                    market_value: Decimal::from(test_case.deposit_market_value),
+                }],
+                borrows: vec![ObligationLiquidity {
+                    borrow_reserve: Pubkey::new_unique(),
+                    cumulative_borrow_rate_wads: Decimal::one(),
+                    borrowed_amount_wads: Decimal::from(test_case.borrow_amount),
+                    market_value: Decimal::from(test_case.borrow_market_value),
+                }],
+                borrowed_value: Decimal::from(test_case.borrow_market_value),
+                ..Obligation::default()
+            };
+
+            assert_eq!(
+                reserve.calculate_liquidation(
+                    u64::MAX, &obligation, &obligation.borrows[0], &obligation.deposits[0]).unwrap(),
+                test_case.liquidation_result);
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct CalculateBorrowTestCase {
+        // args
+        borrow_amount: u64,
+        remaining_borrow_value: Decimal,
+        remaining_reserve_capacity: Decimal,
+
+        // reserve state
+        market_price: Decimal,
+        smoothed_market_price: Decimal,
+        decimal: u8,
+        added_borrow_weight_bps: u64,
+
+        borrow_fee_wad: u64,
+        host_fee: u8,
+
+        result: Result<CalculateBorrowResult, ProgramError>,
+    }
+
+    fn calculate_borrow_test_cases() -> impl Strategy<Value = CalculateBorrowTestCase> {
+        // borrow fee is 1%, host fee is 20% on all test cases
+        prop_oneof![
+            Just(CalculateBorrowTestCase {
+                borrow_amount: LAMPORTS_PER_SOL,
+                remaining_borrow_value: Decimal::from(10u64),
+                remaining_reserve_capacity: Decimal::from(LAMPORTS_PER_SOL * 10),
+
+                market_price: Decimal::from(1u64),
+                smoothed_market_price: Decimal::from(1u64),
+                decimal: 9,
+                added_borrow_weight_bps: 0,
+
+                borrow_fee_wad: 10_000_000_000_000_000, // 1%
+                host_fee: 20,
+
+                result: Ok(CalculateBorrowResult {
+                    borrow_amount: Decimal::from(LAMPORTS_PER_SOL * 101 / 100),
+                    receive_amount: LAMPORTS_PER_SOL,
+                    borrow_fee: LAMPORTS_PER_SOL / 100,
+                    host_fee: LAMPORTS_PER_SOL / 100 / 100 * 20
+                }),
+            }),
+            // borrow max
+            Just(CalculateBorrowTestCase {
+                borrow_amount: u64::MAX,
+                remaining_borrow_value: Decimal::from(10u64),
+                remaining_reserve_capacity: Decimal::from(LAMPORTS_PER_SOL * 101 / 100),
+
+                market_price: Decimal::from(1u64),
+                smoothed_market_price: Decimal::from(1u64),
+                decimal: 9,
+                added_borrow_weight_bps: 0,
+
+                borrow_fee_wad: 10_000_000_000_000_000, // 1%
+                host_fee: 20,
+
+                result: Ok(CalculateBorrowResult {
+                    borrow_amount: Decimal::from(LAMPORTS_PER_SOL * 101 / 100),
+                    receive_amount: LAMPORTS_PER_SOL,
+                    borrow_fee: LAMPORTS_PER_SOL / 100,
+                    host_fee: LAMPORTS_PER_SOL / 100 / 100 * 20
+                }),
+            }),
+            // borrow weight is 2, can only borrow 0.5 sol
+            Just(CalculateBorrowTestCase {
+                borrow_amount: LAMPORTS_PER_SOL / 2,
+                remaining_borrow_value: Decimal::from(1u64),
+                remaining_reserve_capacity: Decimal::from(LAMPORTS_PER_SOL),
+
+                market_price: Decimal::from(1u64),
+                smoothed_market_price: Decimal::from(1u64),
+                decimal: 9,
+                added_borrow_weight_bps: 10_000,
+
+                borrow_fee_wad: 0,
+                host_fee: 0,
+
+                result: Ok(CalculateBorrowResult {
+                    borrow_amount: Decimal::from(LAMPORTS_PER_SOL / 2),
+                    receive_amount: LAMPORTS_PER_SOL / 2,
+                    borrow_fee: 0,
+                    host_fee: 0,
+                }),
+            }),
+            // borrow weight is 2, can only max borrow 0.5 sol
+            Just(CalculateBorrowTestCase {
+                borrow_amount: u64::MAX,
+                remaining_borrow_value: Decimal::from(1u64),
+                remaining_reserve_capacity: Decimal::from(LAMPORTS_PER_SOL),
+
+                market_price: Decimal::from(1u64),
+                smoothed_market_price: Decimal::from(1u64),
+                decimal: 9,
+                added_borrow_weight_bps: 10_000,
+
+                borrow_fee_wad: 0,
+                host_fee: 0,
+
+                result: Ok(CalculateBorrowResult {
+                    borrow_amount: Decimal::from(LAMPORTS_PER_SOL / 2),
+                    receive_amount: LAMPORTS_PER_SOL / 2,
+                    borrow_fee: 0,
+                    host_fee: 0,
+                }),
+            }),
+            // borrow max where ema price is 2x the market price
+            Just(CalculateBorrowTestCase {
+                borrow_amount: u64::MAX,
+                remaining_borrow_value: Decimal::from(100u64),
+                remaining_reserve_capacity: Decimal::from(100 * LAMPORTS_PER_SOL),
+
+                market_price: Decimal::from(10u64),
+                smoothed_market_price: Decimal::from(20u64),
+                decimal: 9,
+                added_borrow_weight_bps: 0,
+
+                borrow_fee_wad: 0,
+                host_fee: 0,
+
+                result: Ok(CalculateBorrowResult {
+                    borrow_amount: Decimal::from(5 * LAMPORTS_PER_SOL),
+                    receive_amount: 5 * LAMPORTS_PER_SOL,
+                    borrow_fee: 0,
+                    host_fee: 0
+                }),
+            }),
+            // borrow max where market price is 2x ema price
+            Just(CalculateBorrowTestCase {
+                borrow_amount: u64::MAX,
+                remaining_borrow_value: Decimal::from(100u64),
+                remaining_reserve_capacity: Decimal::from(100 * LAMPORTS_PER_SOL),
+
+                market_price: Decimal::from(20u64),
+                smoothed_market_price: Decimal::from(10u64),
+                decimal: 9,
+                added_borrow_weight_bps: 0,
+
+                borrow_fee_wad: 0,
+                host_fee: 0,
+
+                result: Ok(CalculateBorrowResult {
+                    borrow_amount: Decimal::from(5 * LAMPORTS_PER_SOL),
+                    receive_amount: 5 * LAMPORTS_PER_SOL,
+                    borrow_fee: 0,
+                    host_fee: 0
+                }),
+            }),
+            // borrow enough where it would be fine if we were just using the market price but
+            // not fine when using both market and ema price
+            Just(CalculateBorrowTestCase {
+                borrow_amount: 7 * LAMPORTS_PER_SOL,
+                remaining_borrow_value: Decimal::from(100u64),
+                remaining_reserve_capacity: Decimal::from(100 * LAMPORTS_PER_SOL),
+
+                market_price: Decimal::from(10u64),
+                smoothed_market_price: Decimal::from(20u64),
+                decimal: 9,
+                added_borrow_weight_bps: 0,
+
+                borrow_fee_wad: 0,
+                host_fee: 0,
+
+                result: Err(LendingError::BorrowTooLarge.into()),
+            }),
+        ]
+    }
+
+    proptest! {
+        #[test]
+        fn calculate_borrow(test_case in calculate_borrow_test_cases()) {
+            let reserve = Reserve {
+                config: ReserveConfig {
+                    added_borrow_weight_bps: test_case.added_borrow_weight_bps,
+                    fees: ReserveFees {
+                        borrow_fee_wad: test_case.borrow_fee_wad,
+                        host_fee_percentage: test_case.host_fee,
+                        flash_loan_fee_wad: 0,
+                    },
+                    ..ReserveConfig::default()
+                },
+                liquidity: ReserveLiquidity {
+                    mint_decimals: test_case.decimal,
+                    market_price: test_case.market_price,
+                    smoothed_market_price: test_case.smoothed_market_price,
+                    available_amount: test_case.remaining_reserve_capacity.to_scaled_val().unwrap() as u64,
+                    ..ReserveLiquidity::default()
+                },
+                ..Reserve::default()
+            };
+            assert_eq!(reserve.calculate_borrow(
+                test_case.borrow_amount,
+                test_case.remaining_borrow_value,
+                test_case.remaining_reserve_capacity,
+            ), test_case.result);
+        }
     }
 }

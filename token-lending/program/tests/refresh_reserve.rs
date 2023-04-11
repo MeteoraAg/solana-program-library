@@ -2,141 +2,354 @@
 
 mod helpers;
 
+use crate::solend_program_test::setup_world;
+use crate::solend_program_test::BalanceChecker;
+use crate::solend_program_test::Info;
+use crate::solend_program_test::Oracle;
+use crate::solend_program_test::PriceArgs;
+use crate::solend_program_test::SolendProgramTest;
+use crate::solend_program_test::SwitchboardPriceArgs;
+use crate::solend_program_test::User;
 use helpers::*;
+use solana_program::instruction::InstructionError;
+use solana_program::native_token::LAMPORTS_PER_SOL;
 use solana_program_test::*;
-use solana_sdk::{
-    pubkey::Pubkey,
-    signature::{Keypair, Signer},
-    transaction::Transaction,
-};
+use solana_sdk::{signature::Keypair, transaction::TransactionError};
+use solend_program::state::LastUpdate;
+use solend_program::state::LendingMarket;
+use solend_program::state::Obligation;
+use solend_program::state::Reserve;
+use solend_program::state::ReserveConfig;
+use solend_program::state::ReserveFees;
+use solend_program::state::ReserveLiquidity;
+use solend_program::NULL_PUBKEY;
 use solend_program::{
-    instruction::refresh_reserve,
-    math::{Decimal, Rate, TryAdd, TryDiv, TryMul},
-    processor::process_instruction,
+    error::LendingError,
+    math::{Decimal, Rate, TryAdd, TryDiv, TryMul, TrySub},
     state::SLOTS_PER_YEAR,
 };
+use std::collections::HashSet;
+
+async fn setup() -> (
+    SolendProgramTest,
+    Info<LendingMarket>,
+    Info<Reserve>,
+    Info<Reserve>,
+    User,
+    Info<Obligation>,
+) {
+    let (mut test, lending_market, usdc_reserve, wsol_reserve, lending_market_owner, user) =
+        setup_world(
+            &ReserveConfig {
+                deposit_limit: u64::MAX,
+                ..test_reserve_config()
+            },
+            &ReserveConfig {
+                fees: ReserveFees {
+                    borrow_fee_wad: 0,
+                    host_fee_percentage: 0,
+                    flash_loan_fee_wad: 0,
+                },
+                protocol_take_rate: 10,
+                ..test_reserve_config()
+            },
+        )
+        .await;
+
+    // init obligation
+    let obligation = lending_market
+        .init_obligation(&mut test, Keypair::new(), &user)
+        .await
+        .expect("This should succeed");
+
+    // deposit 100k USDC
+    lending_market
+        .deposit(&mut test, &usdc_reserve, &user, 100_000_000_000)
+        .await
+        .expect("This should succeed");
+
+    let usdc_reserve = test.load_account(usdc_reserve.pubkey).await;
+
+    // deposit 100k cUSDC
+    lending_market
+        .deposit_obligation_collateral(
+            &mut test,
+            &usdc_reserve,
+            &obligation,
+            &user,
+            100_000_000_000,
+        )
+        .await
+        .expect("This should succeed");
+
+    let wsol_depositor = User::new_with_balances(
+        &mut test,
+        &[
+            (&wsol_mint::id(), 5 * LAMPORTS_PER_SOL),
+            (&wsol_reserve.account.collateral.mint_pubkey, 0),
+        ],
+    )
+    .await;
+
+    // deposit 5SOL. wSOL reserve now has 6 SOL.
+    lending_market
+        .deposit(
+            &mut test,
+            &wsol_reserve,
+            &wsol_depositor,
+            5 * LAMPORTS_PER_SOL,
+        )
+        .await
+        .unwrap();
+
+    // borrow 6 SOL against 100k cUSDC. All sol is borrowed, so the borrow rate should be at max.
+    let obligation = test.load_account::<Obligation>(obligation.pubkey).await;
+    lending_market
+        .borrow_obligation_liquidity(
+            &mut test,
+            &wsol_reserve,
+            &obligation,
+            &user,
+            &lending_market_owner.get_account(&wsol_mint::id()).unwrap(),
+            u64::MAX,
+        )
+        .await
+        .unwrap();
+
+    // populate market price correctly
+    lending_market
+        .refresh_reserve(&mut test, &wsol_reserve)
+        .await
+        .unwrap();
+
+    // populate deposit value correctly.
+    let obligation = test.load_account::<Obligation>(obligation.pubkey).await;
+    lending_market
+        .refresh_obligation(&mut test, &obligation)
+        .await
+        .unwrap();
+
+    let lending_market = test.load_account(lending_market.pubkey).await;
+    let usdc_reserve = test.load_account(usdc_reserve.pubkey).await;
+    let wsol_reserve = test.load_account(wsol_reserve.pubkey).await;
+    let obligation = test.load_account::<Obligation>(obligation.pubkey).await;
+
+    (
+        test,
+        lending_market,
+        usdc_reserve,
+        wsol_reserve,
+        lending_market_owner,
+        obligation,
+    )
+}
 
 #[tokio::test]
 async fn test_success() {
-    let mut test = ProgramTest::new(
-        "solend_program",
-        solend_program::id(),
-        processor!(process_instruction),
-    );
+    let (mut test, lending_market, _, wsol_reserve, _, _) = setup().await;
 
-    // limit to track compute unit increase
-    test.set_bpf_compute_max_units(28_000);
+    // should be maxed out at 30%
+    let borrow_rate = wsol_reserve.account.current_borrow_rate().unwrap();
 
-    const SOL_RESERVE_LIQUIDITY_LAMPORTS: u64 = 100 * LAMPORTS_TO_SOL;
-    const USDC_RESERVE_LIQUIDITY_FRACTIONAL: u64 = 100 * FRACTIONAL_TO_USDC;
-    const BORROW_AMOUNT: u64 = 100;
-
-    let user_accounts_owner = Keypair::new();
-    let lending_market = add_lending_market(&mut test);
-
-    let mut reserve_config = test_reserve_config();
-    reserve_config.loan_to_value_ratio = 80;
-
-    // Configure reserve to a fixed borrow rate of 1%
-    const BORROW_RATE: u8 = 1;
-    reserve_config.min_borrow_rate = BORROW_RATE;
-    reserve_config.optimal_borrow_rate = BORROW_RATE;
-    reserve_config.optimal_utilization_rate = 100;
-
-    let usdc_mint = add_usdc_mint(&mut test);
-    let usdc_oracle = add_usdc_oracle(&mut test);
-    let usdc_test_reserve = add_reserve(
-        &mut test,
-        &lending_market,
-        &usdc_oracle,
-        &user_accounts_owner,
-        AddReserveArgs {
-            borrow_amount: BORROW_AMOUNT,
-            liquidity_amount: USDC_RESERVE_LIQUIDITY_FRACTIONAL,
-            liquidity_mint_decimals: usdc_mint.decimals,
-            liquidity_mint_pubkey: usdc_mint.pubkey,
-            config: reserve_config,
-            slots_elapsed: 1, // elapsed from 1; clock.slot = 2
-            ..AddReserveArgs::default()
+    test.set_price(
+        &wsol_mint::id(),
+        &PriceArgs {
+            price: 20,
+            conf: 1,
+            expo: 1,
+            ema_price: 15,
+            ema_conf: 1,
         },
-    );
+    )
+    .await;
 
-    let sol_oracle = add_sol_oracle(&mut test);
-    let sol_test_reserve = add_reserve(
-        &mut test,
-        &lending_market,
-        &sol_oracle,
-        &user_accounts_owner,
-        AddReserveArgs {
-            borrow_amount: BORROW_AMOUNT,
-            liquidity_amount: SOL_RESERVE_LIQUIDITY_LAMPORTS,
-            liquidity_mint_decimals: 9,
-            liquidity_mint_pubkey: spl_token::native_mint::id(),
-            config: reserve_config,
-            slots_elapsed: 1, // elapsed from 1; clock.slot = 2
-            ..AddReserveArgs::default()
-        },
-    );
+    test.advance_clock_by_slots(1).await;
+    let balance_checker = BalanceChecker::start(&mut test, &[&wsol_reserve]).await;
 
-    let mut test_context = test.start_with_context().await;
-    test_context.warp_to_slot(3).unwrap(); // clock.slot = 3
-
-    let ProgramTestContext {
-        mut banks_client,
-        payer,
-        last_blockhash: recent_blockhash,
-        ..
-    } = test_context;
-
-    let mut transaction = Transaction::new_with_payer(
-        &[
-            refresh_reserve(
-                solend_program::id(),
-                usdc_test_reserve.pubkey,
-                usdc_oracle.pyth_price_pubkey,
-                usdc_oracle.switchboard_feed_pubkey,
-            ),
-            refresh_reserve(
-                solend_program::id(),
-                sol_test_reserve.pubkey,
-                sol_oracle.pyth_price_pubkey,
-                sol_oracle.switchboard_feed_pubkey,
-            ),
-        ],
-        Some(&payer.pubkey()),
-    );
-
-    transaction.sign(&[&payer], recent_blockhash);
-    assert!(banks_client.process_transaction(transaction).await.is_ok());
-
-    let sol_reserve = sol_test_reserve.get_state(&mut banks_client).await;
-    let usdc_reserve = usdc_test_reserve.get_state(&mut banks_client).await;
-
-    let slot_rate = Rate::from_percent(BORROW_RATE)
-        .try_div(SLOTS_PER_YEAR)
+    lending_market
+        .refresh_reserve(&mut test, &wsol_reserve)
+        .await
         .unwrap();
+
+    // check balances
+    assert_eq!(
+        balance_checker.find_balance_changes(&mut test).await,
+        (HashSet::new(), HashSet::new())
+    );
+
+    // check program state
+    let wsol_reserve_post = test.load_account::<Reserve>(wsol_reserve.pubkey).await;
+
+    let slot_rate = borrow_rate.try_div(SLOTS_PER_YEAR).unwrap();
     let compound_rate = Rate::one().try_add(slot_rate).unwrap();
-    let compound_borrow = Decimal::from(BORROW_AMOUNT).try_mul(compound_rate).unwrap();
+    let compound_borrow = Decimal::from(6 * LAMPORTS_PER_SOL)
+        .try_mul(compound_rate)
+        .unwrap();
+    let net_new_debt = compound_borrow
+        .try_sub(Decimal::from(6 * LAMPORTS_PER_SOL))
+        .unwrap();
+    let protocol_take_rate = Rate::from_percent(wsol_reserve.account.config.protocol_take_rate);
+    let delta_accumulated_protocol_fees = net_new_debt.try_mul(protocol_take_rate).unwrap();
 
     assert_eq!(
-        sol_reserve.liquidity.cumulative_borrow_rate_wads,
-        compound_rate.into()
+        wsol_reserve_post.account,
+        Reserve {
+            last_update: LastUpdate {
+                slot: 1001,
+                stale: false
+            },
+            liquidity: ReserveLiquidity {
+                borrowed_amount_wads: compound_borrow,
+                cumulative_borrow_rate_wads: compound_rate.into(),
+                accumulated_protocol_fees_wads: delta_accumulated_protocol_fees,
+                market_price: Decimal::from(200u64),
+                smoothed_market_price: Decimal::from(150u64),
+                ..wsol_reserve.account.liquidity
+            },
+            ..wsol_reserve.account
+        }
+    );
+}
+
+#[tokio::test]
+async fn test_fail_pyth_price_stale() {
+    let (mut test, lending_market, _usdc_reserve, wsol_reserve, _user, _obligation) = setup().await;
+
+    test.advance_clock_by_slots(241).await;
+
+    let res = lending_market
+        .refresh_reserve(&mut test, &wsol_reserve)
+        .await
+        .unwrap_err()
+        .unwrap();
+    println!("{:?}", res);
+
+    assert_eq!(
+        res,
+        TransactionError::InstructionError(
+            0,
+            InstructionError::Custom(LendingError::NullOracleConfig as u32),
+        ),
+    );
+}
+
+#[tokio::test]
+async fn test_success_pyth_price_stale_switchboard_valid() {
+    let (mut test, lending_market, _, wsol_reserve, lending_market_owner, _) = setup().await;
+
+    test.set_price(
+        &wsol_mint::id(),
+        &PriceArgs {
+            price: 9,
+            conf: 0,
+            expo: 0,
+            ema_price: 11,
+            ema_conf: 0,
+        },
+    )
+    .await;
+    test.advance_clock_by_slots(1).await;
+
+    lending_market
+        .refresh_reserve(&mut test, &wsol_reserve)
+        .await
+        .unwrap();
+
+    test.advance_clock_by_slots(241).await;
+
+    test.init_switchboard_feed(&wsol_mint::id()).await;
+    test.set_switchboard_price(&wsol_mint::id(), SwitchboardPriceArgs { price: 8, expo: 0 })
+        .await;
+
+    // update reserve so the switchboard feed is not NULL_PUBKEY
+    lending_market
+        .update_reserve_config(
+            &mut test,
+            &lending_market_owner,
+            &wsol_reserve,
+            wsol_reserve.account.config,
+            wsol_reserve.account.rate_limiter.config,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let wsol_reserve = test.load_account::<Reserve>(wsol_reserve.pubkey).await;
+    lending_market
+        .refresh_reserve(&mut test, &wsol_reserve)
+        .await
+        .unwrap();
+
+    let wsol_reserve_post = test.load_account::<Reserve>(wsol_reserve.pubkey).await;
+
+    // overwrite liquidity market price with the switchboard price but keep the pyth ema price
+    assert_eq!(
+        wsol_reserve_post.account.liquidity.market_price,
+        Decimal::from(8u64)
     );
     assert_eq!(
-        sol_reserve.liquidity.cumulative_borrow_rate_wads,
-        usdc_reserve.liquidity.cumulative_borrow_rate_wads
+        wsol_reserve_post.account.liquidity.smoothed_market_price,
+        Decimal::from(11u64)
     );
-    assert_eq!(sol_reserve.liquidity.borrowed_amount_wads, compound_borrow);
+}
+
+#[tokio::test]
+async fn test_success_only_switchboard_reserve() {
+    let (mut test, lending_market, _, wsol_reserve, lending_market_owner, _) = setup().await;
+
+    test.set_price(
+        &wsol_mint::id(),
+        &PriceArgs {
+            price: 10,
+            conf: 0,
+            expo: 0,
+            ema_price: 11,
+            ema_conf: 0,
+        },
+    )
+    .await;
+
+    test.advance_clock_by_slots(1).await;
+
+    let feed = test.init_switchboard_feed(&wsol_mint::id()).await;
+    test.set_switchboard_price(&wsol_mint::id(), SwitchboardPriceArgs { price: 8, expo: 0 })
+        .await;
+
+    test.advance_clock_by_slots(1).await;
+
+    lending_market
+        .update_reserve_config(
+            &mut test,
+            &lending_market_owner,
+            &wsol_reserve,
+            wsol_reserve.account.config,
+            wsol_reserve.account.rate_limiter.config,
+            Some(&Oracle {
+                pyth_price_pubkey: NULL_PUBKEY,
+                pyth_product_pubkey: NULL_PUBKEY,
+                switchboard_feed_pubkey: Some(feed),
+            }),
+        )
+        .await
+        .unwrap();
+
+    test.advance_clock_by_slots(1).await;
+
+    let wsol_reserve = test.load_account::<Reserve>(wsol_reserve.pubkey).await;
+    lending_market
+        .refresh_reserve(&mut test, &wsol_reserve)
+        .await
+        .unwrap();
+
+    let wsol_reserve_post = test.load_account::<Reserve>(wsol_reserve.pubkey).await;
+
+    // when pyth is null and only switchboard exists, both price fields get overwritten
     assert_eq!(
-        sol_reserve.liquidity.borrowed_amount_wads,
-        usdc_reserve.liquidity.borrowed_amount_wads
+        wsol_reserve_post.account.liquidity.market_price,
+        Decimal::from(8u64)
     );
     assert_eq!(
-        sol_reserve.liquidity.market_price,
-        sol_test_reserve.market_price
-    );
-    assert_eq!(
-        usdc_reserve.liquidity.market_price,
-        usdc_test_reserve.market_price
+        wsol_reserve_post.account.liquidity.smoothed_market_price,
+        Decimal::from(8u64)
     );
 }
