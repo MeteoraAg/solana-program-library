@@ -21,11 +21,11 @@ pub struct RateLimiter {
 
     // state
     /// prev qty is the sum of all outflows from [window_start - config.window_duration, window_start)
-    prev_qty: Decimal,
+    pub prev_qty: Decimal,
     /// window_start is the start of the current window
-    window_start: Slot,
+    pub window_start: Slot,
     /// cur qty is the sum of all outflows from [window_start, window_start + config.window_duration)
-    cur_qty: Decimal,
+    pub cur_qty: Decimal,
 }
 
 /// Lending market configuration parameters
