@@ -1,9 +1,10 @@
 [workspace]
 members = [
-  "token-lending/cli",
-  "token-lending/program",
-  "token-lending/sdk",
-  "token-lending/brick"
+  # "token-lending/cli",
+  # "token-lending/program",
+  # "token-lending/sdk",
+  # "token-lending/brick"
+  "cpi",
 ]
 
 [profile.dev]
